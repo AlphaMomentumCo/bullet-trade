@@ -598,18 +598,34 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             )
         
         if isinstance(order, str):
-            return {
+            result = {
                 "order_id": order,
                 "amount": amount,
                 "price": price,
                 "order_price": price,
                 "requested_order_price": price,
             }
-        result = order or {}
-        result["amount"] = amount
-        result["price"] = price
-        result.setdefault("order_price", price)
-        result.setdefault("requested_order_price", price)
+        else:
+            result = order or {}
+            result["amount"] = amount
+            result["price"] = price
+            result.setdefault("order_price", price)
+            result.setdefault("requested_order_price", price)
+
+        try:
+            from bullet_trade.utils.order_notify import notify_order_submitted
+
+            notify_order_submitted(
+                security=security,
+                side="buy" if is_buy else "sell",
+                amount=amount,
+                order_price=price,
+                last_price=last_price if last_price > 0 else None,
+                order_id=result.get("order_id"),
+            )
+        except Exception as notify_exc:
+            logger.debug("飞书下单通知失败: %s", notify_exc)
+
         return result
     
     async def _get_live_snapshot(self, security: str) -> Dict[str, Any]:

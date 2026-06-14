@@ -1,0 +1,29 @@
+# BulletTrade 飞书机器人配置
+#
+# 复制为 feishu.conf 并填入 webhook：
+#   cp bullet_trade/config/feishu.conf.example bullet_trade/config/feishu.conf
+#
+# 也可通过环境变量覆盖（优先级高于本文件）：
+#   FEISHU_ALERT_WEBHOOK / FEISHU_TRADE_WEBHOOK / FEISHU_REPORT_WEBHOOK
+#   FEISHU_ALERT_ENABLED / FEISHU_TRADE_ENABLED / FEISHU_REPORT_ENABLED
+#   FEISHU_ALERT_TRADE_ALERT=true
+#
+# 配置文件路径可通过 FEISHU_CONF_PATH 指定。
+
+[alert]
+# 告警机器人：行情异动、阈值提醒等
+name = 告警机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/b932bdb8-7cc0-44d8-af29-0e83e2a4a4cc
+enabled = true
+
+[trade]
+# 交易提示机器人：实盘下单通知
+name = 交易提示机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/29ba673e-9502-405d-a944-72f988ed9aa4
+enabled = true
+
+[report]
+# 日报机器人：定时行情日报、周报等
+name = 日报机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/e05a4c85-7ab8-49fe-8e71-3c30530f8bc1
+enabled = true

@@ -1,0 +1,6 @@
+requests
+akshare
+pandas
+python-dotenv
+schedule
+

@@ -758,6 +758,20 @@ class LiveEngine:
                         f"委托[{action_label}] {plan.security} 已提交，订单ID={order_id or '未知'}，"
                         f"数量={plan.amount}"
                     )
+                    try:
+                        from ..utils.order_notify import notify_order_submitted
+
+                        notify_order_submitted(
+                            security=plan.security,
+                            side="buy" if plan.is_buy else "sell",
+                            amount=plan.amount,
+                            order_price=price_arg or plan.price,
+                            last_price=plan.last_price,
+                            order_id=order_id,
+                            current_dt=current_dt,
+                        )
+                    except Exception as notify_exc:
+                        log.debug(f"飞书下单通知失败: {notify_exc}")
                     self._order_debug(
                         "submit",
                         security=plan.security,

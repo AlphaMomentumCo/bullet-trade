@@ -19,6 +19,7 @@
 - **⚡ 回测 & 报告**：分钟/日线回测、真实价格撮合、HTML/PDF 报告一键生成。
 - **💼 实盘接入**：本地 QMT、远程 QMT server、模拟券商按需选择。
 - **🧩 可扩展**：数据/券商接口基于抽象基类，便于自定义实现。
+- **🔔 飞书通知**：实盘下单后可自动推送股票名称、代码、数量、金额、今日涨跌等信息到飞书机器人。
 
 ## 🚀 新手应该先看什么
 
@@ -47,6 +48,137 @@
 - [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare 以及自定义 Provider 配置。
 - [API 文档](docs/api.md)：策略可用 API、类模型与工具函数。
 - [邀请贡献](docs/contributing.md): 贡献与联系方式。 
+
+## 🔔 飞书机器人通知
+
+BulletTrade 与 `feishu_robot/` 共用飞书多机器人配置。配置文件：`bullet_trade/config/feishu.conf`（可从 `feishu.conf.example` 复制）。
+
+### 机器人说明
+
+| 配置键 `[section]` | 用途 | 使用场景 |
+|-------------------|------|---------|
+| `alert` | 告警机器人 | 行情异动、阈值提醒；`trade_alert=true` 时买入/卖出同步告警 |
+| `trade` | 交易提示机器人 | 实盘下单通知（BulletTrade 引擎） |
+| `report` | 日报机器人 | 定时行情日报（`feishu_robot`） |
+
+### 配置文件示例
+
+复制并编辑：
+
+```bash
+cp bullet_trade/config/feishu.conf.example bullet_trade/config/feishu.conf
+```
+
+`feishu.conf` 内容：
+
+```ini
+[alert]
+name = 告警机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/alert-xxxx
+enabled = true
+trade_alert = true
+
+[trade]
+name = 交易提示机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/trade-xxxx
+enabled = true
+
+[report]
+name = 日报机器人
+webhook = https://open.feishu.cn/open-apis/bot/v2/hook/report-xxxx
+enabled = true
+```
+
+也可通过环境变量覆盖（优先级高于 conf 文件）：
+
+```env
+FEISHU_CONF_PATH=/path/to/feishu.conf
+FEISHU_ALERT_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/alert-xxxx
+FEISHU_TRADE_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/trade-xxxx
+FEISHU_REPORT_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/report-xxxx
+FEISHU_ORDER_NOTIFY=true
+```
+
+兼容旧变量：`FEISHU_WEBHOOK` / `FEISHU_BOT_WEBHOOK` 会作为 `[trade]` 的 webhook 回退。
+
+### 触发时机（交易提示机器人）
+
+以下路径在**下单成功提交到券商后**会自动入队发送，不阻塞主流程：
+
+| 运行方式 | 触发位置 |
+|---------|---------|
+| 本地 QMT 实盘（方案 A） | `bullet_trade/core/live_engine.py` |
+| 远程 QMT server / 聚宽 helper（方案 B） | `bullet_trade/server/adapters/qmt.py` |
+
+### 消息字段
+
+消息仅包含**当前能获取到的字段**，缺失数据会自动省略：
+
+| 字段 | 说明 |
+|------|------|
+| 股票名称 | 来自 `get_security_info` |
+| 股票代码 | 策略标的代码，如 `600519.XSHG` |
+| 方向 | 买入 / 卖出 |
+| 下单数量 | 股数 |
+| 下单金额 | 委托价（或现价）× 数量 |
+| 现价 | 下单时最新价 |
+| 今日涨跌 | 现价相对昨收的涨跌幅（%） |
+| 委托价 | 限价或市价保护价 |
+| 订单 ID | 券商返回的订单号 |
+
+### 代码接口
+
+```python
+from bullet_trade.utils.feishu_config import BOT_ALERT, BOT_TRADE, BOT_REPORT, get_feishu_webhook
+from bullet_trade.utils.order_notify import notify_order_submitted
+from bullet_trade.utils.feishu_notifier import (
+    send_order_notification,
+    enqueue_feishu_text,
+    enqueue_alert_text,
+    enqueue_report_text,
+    format_order_notification,
+)
+
+# 下单成功后（一般由引擎自动调用，走 trade 机器人）
+notify_order_submitted(
+    security="600519.XSHG",
+    side="buy",
+    amount=100,
+    order_price=1850.0,
+    last_price=1848.5,
+    order_id="123456",
+)
+
+# 指定机器人发送文本
+enqueue_alert_text("某标的涨跌幅超过阈值")
+enqueue_feishu_text("策略启动", bot=BOT_TRADE)
+enqueue_report_text("自定义日报内容")
+
+# 手动组装并发送下单通知
+send_order_notification({
+    "code": "600519.XSHG",
+    "name": "贵州茅台",
+    "side": "buy",
+    "amount": 100,
+    "order_value": 185000.0,
+    "day_change": 1.25,
+}, bot=BOT_TRADE)
+```
+
+### 消息示例
+
+```text
+📈 **下单通知**
+
+**贵州茅台** (600519.XSHG)
+方向：买入
+数量：100 股
+金额：¥185,000.00
+现价：1850.00
+今日涨跌：+1.25%
+订单ID：123456
+时间：2026-06-14 10:15:30
+```
 
 ## 🔗 链接
 

@@ -1,0 +1,162 @@
+[
+  {
+    "code": "sh600519",
+    "name": "贵州茅台",
+    "price": 1291.91,
+    "change": 1.01,
+    "change_amount": 12.91,
+    "open": 1271.18,
+    "prev_close": 1279.0,
+    "high": 1295.0,
+    "low": 1265.01,
+    "timestamp": "2026-06-12T22:31:09.747489",
+    "volume": 5049478.0,
+    "amount": 6477910214.0
+  },
+  {
+    "code": "sz000001",
+    "name": "平安银行",
+    "price": 11.24,
+    "change": 2.74,
+    "change_amount": 0.3,
+    "open": 11.0,
+    "prev_close": 10.94,
+    "high": 11.25,
+    "low": 10.88,
+    "timestamp": "2026-06-12T22:31:09.747489",
+    "volume": 203235546.0,
+    "amount": 2263042930.57
+  },
+  {
+    "code": "hk00700",
+    "name": "腾讯控股",
+    "price": 463.60001,
+    "change": 1.4,
+    "change_amount": 6.4,
+    "open": 466.0,
+    "prev_close": 457.2,
+    "high": 467.0,
+    "low": 459.4,
+    "volume": 9375317042.0,
+    "timestamp": "2026-06-12T22:31:09.747489"
+  },
+  {
+    "code": "usAAPL",
+    "name": "苹果",
+    "price": 292.1,
+    "change": -1.19,
+    "change_amount": -3.53,
+    "open": 296.03,
+    "high": 297.14,
+    "low": 290.61,
+    "volume": 9177218.0,
+    "timestamp": "2026-06-12T22:31:09.747489"
+  },
+  {
+    "code": "000001",
+    "name": "华夏成长混合",
+    "nav": 1.286,
+    "change": 0.0,
+    "change_amount": 0.0,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:31:23.802352"
+  },
+  {
+    "code": "110011",
+    "name": "易方达优质精选混合(QDII)",
+    "nav": 4.3378,
+    "change": 0.75,
+    "change_amount": 0.0325,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:31:23.804387"
+  },
+  {
+    "code": "161725",
+    "name": "招商中证白酒指数(LOF)A",
+    "nav": 0.5467,
+    "change": 0.24,
+    "change_amount": 0.0013,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:31:23.805404"
+  },
+  {
+    "code": "sh600519",
+    "name": "贵州茅台",
+    "price": 1291.91,
+    "change": 1.01,
+    "change_amount": 12.91,
+    "open": 1271.18,
+    "prev_close": 1279.0,
+    "high": 1295.0,
+    "low": 1265.01,
+    "timestamp": "2026-06-12T22:35:56.632481",
+    "volume": 5049478.0,
+    "amount": 6477910214.0
+  },
+  {
+    "code": "sz000001",
+    "name": "平安银行",
+    "price": 11.24,
+    "change": 2.74,
+    "change_amount": 0.3,
+    "open": 11.0,
+    "prev_close": 10.94,
+    "high": 11.25,
+    "low": 10.88,
+    "timestamp": "2026-06-12T22:35:56.632481",
+    "volume": 203235546.0,
+    "amount": 2263042930.57
+  },
+  {
+    "code": "hk00700",
+    "name": "腾讯控股",
+    "price": 463.60001,
+    "change": 1.4,
+    "change_amount": 6.4,
+    "open": 466.0,
+    "prev_close": 457.2,
+    "high": 467.0,
+    "low": 459.4,
+    "volume": 9375317042.0,
+    "timestamp": "2026-06-12T22:35:56.632481"
+  },
+  {
+    "code": "usAAPL",
+    "name": "苹果",
+    "price": 291.765,
+    "change": -1.31,
+    "change_amount": -3.865,
+    "open": 296.03,
+    "high": 297.14,
+    "low": 290.61,
+    "volume": 9516305.0,
+    "timestamp": "2026-06-12T22:35:56.632481"
+  },
+  {
+    "code": "000001",
+    "name": "华夏成长混合",
+    "nav": 1.286,
+    "change": 0.0,
+    "change_amount": 0.0,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:36:11.357304"
+  },
+  {
+    "code": "110011",
+    "name": "易方达优质精选混合(QDII)",
+    "nav": 4.3378,
+    "change": 0.75,
+    "change_amount": 0.0325,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:36:11.358514"
+  },
+  {
+    "code": "161725",
+    "name": "招商中证白酒指数(LOF)A",
+    "nav": 0.5467,
+    "change": 0.24,
+    "change_amount": 0.0013,
+    "date": "2026-06-12",
+    "timestamp": "2026-06-12T22:36:11.359613"
+  }
+]

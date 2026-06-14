@@ -137,6 +137,8 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+bullet_trade/config/feishu.conf
+feishu.conf
 .venv
 env/
 venv/
