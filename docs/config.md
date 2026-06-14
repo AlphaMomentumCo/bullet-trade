@@ -133,7 +133,9 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |
 | `RUNTIME_DIR` | `./runtime` | 运行态目录，保存 live 状态、`g` 自动保存等文件。 |
 | `BULLET_TRADE_HOME` | 用户 home | 研究环境、JupyterLab 设置、live lock 等默认目录的根路径覆盖。 |
-| `MESSAGE_KEY` / `WECHAT_MESSAGE_KEY` | 空 | 企业微信机器人 key，配置后 `send_msg` 会尝试推送。 |
+| `MESSAGE_CHANNEL` / `NOTIFY_CHANNEL` | 自动 | 消息上报通道：`wechat`（企业微信）或 `feishu`（飞书）。未设置时：有 `MESSAGE_KEY` 走企微，否则有飞书 `[trade]` 配置走飞书。 |
+| `MESSAGE_KEY` / `WECHAT_MESSAGE_KEY` | 空 | 企业微信机器人 key；`MESSAGE_CHANNEL=wechat` 时使用。 |
+| `FEISHU_ORDER_NOTIFY` | `true` | 飞书通道下是否发送下单通知。 |
 | `BT_LIVE_ORDER_DEBUG` | `false` | 打印 live/QMT 下单调试日志。 |
 | `LOG_FORCE_COLOR` | 空 | 强制彩色日志。 |
 | `NO_COLOR` | 空 | 禁用彩色日志。 |

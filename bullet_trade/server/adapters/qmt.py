@@ -613,7 +613,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             result.setdefault("requested_order_price", price)
 
         try:
-            from bullet_trade.utils.order_notify import notify_order_submitted
+            from bullet_trade.core.notifications import notify_order_submitted
 
             notify_order_submitted(
                 security=security,

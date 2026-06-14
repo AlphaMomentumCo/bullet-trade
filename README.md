@@ -51,7 +51,21 @@
 
 ## 🔔 飞书机器人通知
 
-BulletTrade 与 `feishu_robot/` 共用飞书多机器人配置。配置文件：`bullet_trade/config/feishu.conf`（可从 `feishu.conf.example` 复制）。
+飞书多机器人配置见 `bullet_trade/config/feishu.conf`（可从 `feishu.conf.example` 复制），统一经 `bullet_trade/core/notifications.py` 的 `send_msg` 上报。
+
+在 `.env` 中用 `MESSAGE_CHANNEL` 选择 `send_msg` / 下单通知的上报通道（**二选一**）：
+
+```env
+# 企业微信
+MESSAGE_CHANNEL=wechat
+MESSAGE_KEY=your-wechat-bot-key
+
+# 或飞书（webhook 写在 feishu.conf 或环境变量）
+MESSAGE_CHANNEL=feishu
+FEISHU_ORDER_NOTIFY=true
+```
+
+未设置 `MESSAGE_CHANNEL` 时自动推断：配置了 `MESSAGE_KEY` 则走企微，否则若飞书 `[trade]` 已配置则走飞书。
 
 ### 机器人说明
 
@@ -59,7 +73,7 @@ BulletTrade 与 `feishu_robot/` 共用飞书多机器人配置。配置文件：
 |-------------------|------|---------|
 | `alert` | 告警机器人 | 行情异动、阈值提醒；`trade_alert=true` 时买入/卖出同步告警 |
 | `trade` | 交易提示机器人 | 实盘下单通知（BulletTrade 引擎） |
-| `report` | 日报机器人 | 定时行情日报（`feishu_robot`） |
+| `report` | 日报机器人 | 策略内 `send_msg(..., feishu_bot=FEISHU_BOT_REPORT)` |
 
 ### 配置文件示例
 
@@ -128,18 +142,15 @@ FEISHU_ORDER_NOTIFY=true
 
 ### 代码接口
 
-```python
-from bullet_trade.utils.feishu_config import BOT_ALERT, BOT_TRADE, BOT_REPORT, get_feishu_webhook
-from bullet_trade.utils.order_notify import notify_order_submitted
-from bullet_trade.utils.feishu_notifier import (
-    send_order_notification,
-    enqueue_feishu_text,
-    enqueue_alert_text,
-    enqueue_report_text,
-    format_order_notification,
-)
+统一入口：`bullet_trade/core/notifications.py`
 
-# 下单成功后（一般由引擎自动调用，走 trade 机器人）
+```python
+from bullet_trade.core.notifications import send_msg, notify_order_submitted
+
+# 策略消息（按 MESSAGE_CHANNEL 路由到企微或飞书）
+send_msg("策略启动")
+
+# 下单通知（同样走 send_msg 路由）
 notify_order_submitted(
     security="600519.XSHG",
     side="buy",
@@ -148,21 +159,24 @@ notify_order_submitted(
     last_price=1848.5,
     order_id="123456",
 )
+```
 
-# 指定机器人发送文本
-enqueue_alert_text("某标的涨跌幅超过阈值")
-enqueue_feishu_text("策略启动", bot=BOT_TRADE)
-enqueue_report_text("自定义日报内容")
+高级用法（飞书多机器人、手动格式化等）：
 
-# 手动组装并发送下单通知
-send_order_notification({
-    "code": "600519.XSHG",
-    "name": "贵州茅台",
-    "side": "buy",
-    "amount": 100,
-    "order_value": 185000.0,
-    "day_change": 1.25,
-}, bot=BOT_TRADE)
+```python
+from bullet_trade.core.notifications import (
+    FEISHU_BOT_ALERT,
+    FEISHU_BOT_TRADE,
+    get_message_channel,
+    send_order_notification,
+    format_order_notification,
+)
+
+# 查看当前通道
+get_message_channel()  # "wechat" | "feishu" | None
+
+# 飞书通道下指定机器人（仅 MESSAGE_CHANNEL=feishu 时生效）
+send_msg("自定义告警", feishu_bot=FEISHU_BOT_ALERT)
 ```
 
 ### 消息示例

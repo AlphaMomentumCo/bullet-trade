@@ -759,7 +759,7 @@ class LiveEngine:
                         f"数量={plan.amount}"
                     )
                     try:
-                        from ..utils.order_notify import notify_order_submitted
+                        from .notifications import notify_order_submitted
 
                         notify_order_submitted(
                             security=plan.security,

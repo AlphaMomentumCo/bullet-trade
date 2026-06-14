@@ -20,7 +20,7 @@
 - `log`：日志对象，支持 `debug/info/warn/error/critical`；`log.set_level(module, level)` 兼容聚宽（`module` 取 `system/strategy`，`strategy` 会调整实际输出级别）。
 - 常用模块别名：`datetime/math/random/time/np/pd` 已自动导出，无需额外导入。
 - 消息通知：
-  - `send_msg(message)`：输出 `[策略消息] ...` 日志，并在存在自定义 handler 时调用；若 `.env` 配置 `MESSAGE_KEY` 或 `WECHAT_MESSAGE_KEY`，会通过企业微信机器人发送（失败仅记录日志，不抛错）。
+  - `send_msg(message)`：输出 `[策略消息] ...` 日志，并在存在自定义 handler 时调用；按 `.env` 的 `MESSAGE_CHANNEL`（`wechat` / `feishu`）路由到企业微信或飞书（失败仅记录日志，不抛错）。
   - `set_message_handler(handler)`：注册自定义处理函数（例如推送到 IM/邮件），传入 `None` 可清除。
 
 ## 策略生命周期函数 {#lifecycle}
