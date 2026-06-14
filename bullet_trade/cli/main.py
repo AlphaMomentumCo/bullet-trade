@@ -340,6 +340,9 @@ def create_parser():
 
 def main():
     """主函数"""
+    from bullet_trade.utils.project_path import ensure_project_root_on_path
+
+    ensure_project_root_on_path()
     parser = create_parser()
     args = parser.parse_args()
     # 若提供 env 文件，覆盖加载一次，便于区分客户端/服务端环境

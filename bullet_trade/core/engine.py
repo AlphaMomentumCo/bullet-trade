@@ -230,6 +230,14 @@ class BacktestEngine:
 
         log.info(f"加载策略文件: {self.strategy_file}")
 
+        # 确保项目根目录在 sys.path，使 from jqdata import * 可找到根目录 jqdata.py
+        try:
+            from ..utils.project_path import ensure_project_root_on_path
+
+            ensure_project_root_on_path()
+        except Exception as exc:
+            log.debug(f"注入项目根路径失败: {exc}")
+
         # 重置全局状态
         reset_globals()
         reset_settings()
