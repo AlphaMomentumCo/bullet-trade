@@ -26,7 +26,7 @@ description: 为 BulletTrade 编写、修改、回测、优化、解释或落地
 3. 生成最小可运行方案。
 - 新策略先从最小模板出发
 - 只使用 `references/public-api.md` 中明确列出的能力
-- 若用户明确要求 Tushare，可优先改写或复用 `references/strategy-examples-tushare.md` 中的样例
+- 这里是一些参考样例 `references/strategy-examples-tushare.md`  
 - 对未实现的 JoinQuant API，不要臆造替代品
 
 4. 执行并验证。
