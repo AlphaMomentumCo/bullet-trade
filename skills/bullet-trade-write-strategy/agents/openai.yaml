@@ -1,0 +1,7 @@
+interface:
+  display_name: "BulletTrade Write Strategy"
+  short_description: "为 BulletTrade 编写策略、回测优化与运行命令的技能"
+  default_prompt: "Use $bullet-trade-write-strategy to write, backtest, optimize, or operationalize a BulletTrade strategy."
+
+policy:
+  allow_implicit_invocation: true
