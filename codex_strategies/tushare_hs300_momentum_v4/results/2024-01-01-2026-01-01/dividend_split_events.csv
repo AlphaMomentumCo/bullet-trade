@@ -1,0 +1,3 @@
+﻿event_type,strategy_time,code,event_date,per_base,bonus_pre_tax,net_bonus,tax_rate_percent,cash_in,scale_factor,old_amount,new_amount,cash_before,cash_after,positions_value_before,positions_value_after,total_value_before,total_value_after
+现金分红,2024-12-31 09:00:00,511880.XSHG,2024-12-31,1,1.5521,1.5521,0,1241.68,,,,7475.630000000077,8717.310000000078,81290.4,81290.4,88766.03000000007,90007.71000000008
+现金分红,2025-12-31 09:00:00,511880.XSHG,2025-12-31,1,1.1553,1.1553,0,808.71,,,,7632.780000000159,8441.490000000158,70834.4,70834.4,78467.18000000015,79275.89000000016
