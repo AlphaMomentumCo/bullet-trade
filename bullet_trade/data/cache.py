@@ -27,9 +27,9 @@ class CacheManager:
     ) -> None:
         self.provider_name = provider_name or "unknown"
         if cache_dir is not None:
-            self.cache_dir = cache_dir
+            self.cache_dir = os.path.expanduser(cache_dir) if cache_dir else ""
         elif fallback_to_env:
-            base_dir = os.getenv("DATA_CACHE_DIR", "")
+            base_dir = os.path.expanduser(os.getenv("DATA_CACHE_DIR", "") or "")
             self.cache_dir = os.path.join(base_dir, self.provider_name) if base_dir else ""
         else:
             self.cache_dir = ""

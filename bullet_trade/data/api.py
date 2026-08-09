@@ -1561,12 +1561,26 @@ class BacktestCurrentData:
                     )
                 return kw
 
-            if use_minute:
-                df = _call_provider_get_price_with_security_fallback(
-                    **_build_fetch_kwargs("minute")
-                )
+            freq_text = "minute" if use_minute else "daily"
+            fetch_kwargs = _build_fetch_kwargs(freq_text)
+            session_df = _try_get_price_from_backtest_session(
+                security=security,
+                start_date=None,
+                end_date=current_dt,
+                frequency=freq_text,
+                fields=fields,
+                skip_paused=False,
+                fq="pre",
+                count=1,
+                panel=True,
+                fill_paused=True,
+                use_real_price=bool(use_real_price),
+                force_no_engine=bool(force_no_engine),
+            )
+            if session_df is not None and not getattr(session_df, "empty", True):
+                df = session_df
             else:
-                df = _call_provider_get_price_with_security_fallback(**_build_fetch_kwargs("daily"))
+                df = _call_provider_get_price_with_security_fallback(**fetch_kwargs)
 
             if not df.empty:
                 if "time" in df.columns and "code" in df.columns:

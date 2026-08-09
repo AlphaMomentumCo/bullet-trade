@@ -270,8 +270,21 @@ class BacktestDataSessionConfig:
         """
         overrides = dict(overrides or {})
         enabled_value = overrides.pop("enabled", os.getenv("BT_BACKTEST_DATA_SESSION"))
+        enabled = parse_bool(enabled_value, default=False)
+        # 会话开启且未显式配置 PRICE_BLOCKS 时，默认打开行情块缓存
+        if "price_block_cache_enabled" in overrides:
+            price_block_raw = overrides.pop("price_block_cache_enabled")
+            price_block_default = False
+        else:
+            price_block_env = os.getenv("BT_BACKTEST_DATA_SESSION_PRICE_BLOCKS")
+            if price_block_env is None:
+                price_block_raw = enabled
+                price_block_default = bool(enabled)
+            else:
+                price_block_raw = price_block_env
+                price_block_default = False
         config = cls(
-            enabled=parse_bool(enabled_value, default=False),
+            enabled=enabled,
             qmt_download_dedup=parse_bool(
                 overrides.pop(
                     "qmt_download_dedup",
@@ -280,11 +293,8 @@ class BacktestDataSessionConfig:
                 default=True,
             ),
             price_block_cache_enabled=parse_bool(
-                overrides.pop(
-                    "price_block_cache_enabled",
-                    os.getenv("BT_BACKTEST_DATA_SESSION_PRICE_BLOCKS", "false"),
-                ),
-                default=False,
+                price_block_raw,
+                default=price_block_default,
             ),
             current_bar_cache_enabled=parse_bool(
                 overrides.pop(

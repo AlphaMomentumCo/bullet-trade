@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date as Date
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -23,6 +24,8 @@ class TushareProvider(DataProvider):
         self._tushare_custom_url = self.config.get("tushare_custom_url") or os.getenv("TUSHARE_CUSTOM_URL")
         cache_dir_set = "cache_dir" in self.config
         cache_dir = self.config.get("cache_dir")
+        if isinstance(cache_dir, str) and cache_dir:
+            cache_dir = os.path.expanduser(cache_dir)
         self._cache = CacheManager(
             provider_name=self.name,
             cache_dir=cache_dir,
@@ -30,6 +33,14 @@ class TushareProvider(DataProvider):
         )
         self._pro = None
         self._asset_type_cache: Dict[str, str] = {}
+        # 进程内记忆缓存：即使关闭磁盘缓存也能避免重复打网（回测友好）
+        # bench 可设 mem_cache=False 测冷启动
+        mem_cfg = self.config.get("mem_cache")
+        if mem_cfg is None:
+            mem_cfg = os.getenv("TUSHARE_MEM_CACHE", "1") not in ("0", "false", "False", "")
+        self._mem_cache_enabled = bool(mem_cfg)
+        self._mem: Dict[str, Any] = {}
+        self._tick_src = self.config.get("tick_src") or os.getenv("TUSHARE_TICK_SRC", "tt")
 
     # ------------------------ 公共工具 ------------------------
     @classmethod
@@ -68,6 +79,28 @@ class TushareProvider(DataProvider):
             self.auth()
         return self._pro
 
+    def _memo_get(self, key: str) -> Tuple[bool, Any]:
+        if not self._mem_cache_enabled:
+            return False, None
+        if key in self._mem:
+            return True, self._mem[key]
+        return False, None
+
+    def _memo_set(self, key: str, value: Any) -> Any:
+        if self._mem_cache_enabled:
+            self._mem[key] = value
+        return value
+
+    def _memo_call(self, key: str, fetch_fn: Callable[[], Any]) -> Any:
+        hit, value = self._memo_get(key)
+        if hit:
+            return value
+        return self._memo_set(key, fetch_fn())
+
+    def clear_mem_cache(self) -> None:
+        self._mem.clear()
+        self._asset_type_cache.clear()
+
     def _format_date(self, value: Optional[Union[str, datetime, Date]]) -> Optional[str]:
         if value is None:
             return None
@@ -80,6 +113,28 @@ class TushareProvider(DataProvider):
         if isinstance(value, Date):
             return value.strftime("%Y%m%d")
         return None
+
+    @staticmethod
+    def _format_date_dash(value: Optional[Union[str, datetime, Date]]) -> Optional[str]:
+        if value is None:
+            return None
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+
+    def _estimate_start_for_count(
+        self,
+        end_date: Optional[Union[str, datetime, Date]],
+        count: int,
+        frequency: str,
+    ) -> str:
+        """按 count 估算 start_date，避免 pro_bar/daily 拉全历史。"""
+        end_dt = pd.to_datetime(end_date) if end_date is not None else pd.Timestamp.today()
+        freq = self._normalize_frequency(frequency)
+        if self._is_minute_frequency(freq):
+            # 约 240 根/日；再留周末缓冲
+            cal_days = max(int(count / 200) + 3, 5)
+        else:
+            cal_days = max(int(count * 2.2) + 8, 15)
+        return (end_dt - pd.Timedelta(days=cal_days)).strftime("%Y%m%d")
 
     def _normalize_frequency(self, frequency: str) -> str:
         freq = frequency.lower()
@@ -196,9 +251,10 @@ class TushareProvider(DataProvider):
         ts = self._ensure_ts_module()
         self._pro = ts.pro_api(token)
         self._token = token
-        # 支持自定义 API URL
+        # 支持自定义 API URL（去掉首尾空白与误粘贴引号）
         tushare_custom_url = host or self._tushare_custom_url
         if tushare_custom_url:
+            tushare_custom_url = str(tushare_custom_url).strip().strip('"').strip("'")
             self._pro._DataApi__http_url = tushare_custom_url
             print("使用自定义的URL")
     # ------------------------ K 线数据 ------------------------
@@ -266,6 +322,50 @@ class TushareProvider(DataProvider):
         merged = pd.concat(long_rows, axis=0)
         return merged
 
+    def _fetch_ohlcv_raw(
+        self,
+        ts_code: str,
+        asset: str,
+        start_str: Optional[str],
+        end_str: Optional[str],
+        freq: str,
+        fq: Optional[str],
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> Tuple[pd.DataFrame, bool]:
+        """
+        拉取未复权/原始 OHLCV。
+        返回 (df, already_qfq)。
+        日线股票前复权：优先 daily（代理上显著快于 pro_bar adj=qfq），复权交给本地 adj_factor。
+        """
+        ts = self._ensure_ts_module()
+        pro = self._ensure_client()
+        _ = fq, pre_factor_ref_date
+
+        if freq == "D" and asset == "E":
+            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            return (df if df is not None else pd.DataFrame()), False
+        if freq == "D" and asset == "I":
+            df = pro.index_daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            return (df if df is not None else pd.DataFrame()), False
+        if freq == "D" and asset == "FD":
+            try:
+                df = pro.fund_daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+                if df is not None and not df.empty:
+                    return df, False
+            except Exception:
+                pass
+
+        df = ts.pro_bar(
+            ts_code=ts_code,
+            start_date=start_str,
+            end_date=end_str,
+            freq=freq,
+            adj=None,
+            asset=asset,
+            api=pro,
+        )
+        return (df if df is not None else pd.DataFrame()), False
+
     def _get_price_single(
         self,
         security: str,
@@ -279,27 +379,69 @@ class TushareProvider(DataProvider):
         pre_factor_ref_date: Optional[Union[str, datetime]],
         asset: Optional[str] = None,
     ) -> pd.DataFrame:
-        start_str = self._format_date(start_date)
         end_str = self._format_date(end_date)
         freq = self._normalize_frequency(frequency)
-        ts = self._ensure_ts_module()
-        pro = self._ensure_client()
         asset = asset or self._infer_asset(security)
         ts_code = self._to_ts_code(security)
 
-        df = ts.pro_bar(
-            ts_code=ts_code,
-            start_date=start_str,
-            end_date=end_str,
-            freq=freq,
-            adj=None,
-            asset=asset,
-            api=pro,
+        start_str = self._format_date(start_date)
+        if count and not start_str:
+            start_str = self._estimate_start_for_count(end_date or end_str, int(count), frequency)
+
+        mem_key = (
+            f"price:{ts_code}:{start_str}:{end_str}:{freq}:{fq}:{count}:"
+            f"{self._format_date(pre_factor_ref_date)}:{skip_paused}:{tuple(fields or ())}"
         )
+        hit, cached = self._memo_get(mem_key)
+        if hit:
+            return cached.copy() if isinstance(cached, pd.DataFrame) else cached
+
+        need_adj = asset == "E" and fq in ("pre", "post")
+        # 日线前复权：daily 与 adj_factor 并行，避免串行双 RTT
+        factor_df = None
+        if need_adj and freq == "D":
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_px = pool.submit(
+                        self._fetch_ohlcv_raw,
+                        ts_code,
+                        asset,
+                        start_str,
+                        end_str,
+                        freq,
+                        fq,
+                        pre_factor_ref_date,
+                    )
+                    # adj 窗口先按请求区间取；空数据时后面再兜底
+                    start_for_adj = start_str or end_str
+                    end_for_adj = end_str or start_str
+                    fut_adj = pool.submit(
+                        self._fetch_adj_factor,
+                        security,
+                        pd.to_datetime(start_for_adj),
+                        pd.to_datetime(end_for_adj),
+                    )
+                    df, already_qfq = fut_px.result()
+                    factor_df = fut_adj.result()
+            except Exception:
+                df, already_qfq = self._fetch_ohlcv_raw(
+                    ts_code, asset, start_str, end_str, freq, fq, pre_factor_ref_date
+                )
+                factor_df = None
+        else:
+            df, already_qfq = self._fetch_ohlcv_raw(
+                ts_code, asset, start_str, end_str, freq, fq, pre_factor_ref_date
+            )
+
         if df is None or df.empty:
-            return pd.DataFrame()
+            return self._memo_set(mem_key, pd.DataFrame())
 
         time_col = "trade_time" if self._is_minute_frequency(freq) and "trade_time" in df.columns else "trade_date"
+        if time_col not in df.columns:
+            for cand in ("trade_time", "trade_date", "datetime"):
+                if cand in df.columns:
+                    time_col = cand
+                    break
         df = df.sort_values(time_col)
         df.index = pd.to_datetime(df[time_col])
         df.rename(
@@ -312,7 +454,7 @@ class TushareProvider(DataProvider):
             inplace=True,
         )
         if "ts_code" in df.columns:
-            df["ts_code"] = df["ts_code"].apply(self._to_jq_code)
+            df["ts_code"] = df["ts_code"].map(self._to_jq_code)
         df["money"] = df.get("money", 0.0)
         df["volume"] = df.get("volume", 0.0)
         df = self._normalize_price_units(df, freq, asset)
@@ -320,19 +462,65 @@ class TushareProvider(DataProvider):
         if skip_paused and "is_paused" in df.columns:
             df = df[df["is_paused"] == 0]
 
-        if asset == "E" and fq in ("pre", "post"):
-            df = self._apply_adjustment(
-                security=security,
-                df=df,
-                fq=fq,
-                pre_factor_ref_date=pre_factor_ref_date,
-            )
+        if need_adj and not already_qfq:
+            if factor_df is not None and not factor_df.empty and "adj_factor" in factor_df.columns:
+                df = self._apply_adjustment_with_factor(
+                    df, factor_df, fq=fq, pre_factor_ref_date=pre_factor_ref_date
+                )
+            else:
+                df = self._apply_adjustment(
+                    security=security,
+                    df=df,
+                    fq=fq,
+                    pre_factor_ref_date=pre_factor_ref_date,
+                )
 
         if count:
             df = df.tail(count)
 
         df = self._apply_fields(df, fields)
-        return df
+        return self._memo_set(mem_key, df)
+
+    def _apply_adjustment_with_factor(
+        self,
+        df: pd.DataFrame,
+        factor_df: pd.DataFrame,
+        fq: str,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
+        """用已取回的 adj_factor 做复权（避免重复打网）。"""
+        if factor_df is None or factor_df.empty or "adj_factor" not in factor_df.columns:
+            return df
+        start_dt = df.index.min()
+        end_dt = df.index.max()
+        factor_df = factor_df.copy()
+        factor_df.index = pd.to_datetime(factor_df["trade_date"]).dt.normalize()
+        merged = df.copy()
+        merged["_factor_date"] = pd.to_datetime(merged.index).normalize()
+        merged = merged.join(factor_df["adj_factor"], on="_factor_date", how="left")
+        merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
+        ref_date = pre_factor_ref_date
+        if ref_date is None and fq == "pre":
+            # 用区间末日作基准，避免再打 get_trade_days
+            ref_date = end_dt
+        if ref_date is None:
+            ref_date = end_dt if fq == "pre" else start_dt
+        try:
+            ref_dt = pd.to_datetime(ref_date).normalize()
+        except Exception:
+            ref_dt = pd.to_datetime(end_dt if fq == "pre" else start_dt).normalize()
+        if ref_dt in factor_df.index:
+            ref_factor = factor_df.loc[ref_dt, "adj_factor"]
+        else:
+            ref_factor = merged["adj_factor"].iloc[-1] if fq == "pre" else merged["adj_factor"].iloc[0]
+        if ref_factor is None or (isinstance(ref_factor, float) and pd.isna(ref_factor)):
+            return df
+        ratio = (merged["adj_factor"] / ref_factor) if fq == "pre" else (ref_factor / merged["adj_factor"])
+        for col in ["open", "high", "low", "close"]:
+            if col in merged.columns:
+                merged[col] = merged[col] * ratio
+        merged.drop(columns=["adj_factor", "_factor_date"], inplace=True, errors="ignore")
+        return merged
 
     def _apply_adjustment(
         self,
@@ -352,43 +540,7 @@ class TushareProvider(DataProvider):
                 pre_factor_ref_date=pre_factor_ref_date,
             )
             return fallback if not fallback.empty else df
-
-        factor_df.index = pd.to_datetime(factor_df["trade_date"]).dt.normalize()
-        merged = df.copy()
-        merged["_factor_date"] = pd.to_datetime(merged.index).normalize()
-        merged = merged.join(factor_df["adj_factor"], on="_factor_date", how="left")
-        merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
-        ref_date = pre_factor_ref_date
-        if ref_date is None and fq == "pre":
-            latest_trade_day = self._latest_trade_day()
-            ref_date = latest_trade_day or Date.today()
-        if ref_date is None:
-            ref_date = end_dt if fq == "pre" else start_dt
-        try:
-            ref_dt = pd.to_datetime(ref_date).normalize()
-        except Exception:
-            ref_dt = pd.to_datetime(end_dt if fq == "pre" else start_dt).normalize()
-        ref_factor = None
-        if ref_dt is not None:
-            if ref_dt in factor_df.index:
-                ref_factor = factor_df.loc[ref_dt, "adj_factor"]
-            else:
-                extra_df = self._fetch_adj_factor(security, ref_dt, ref_dt)
-                if not extra_df.empty and "adj_factor" in extra_df.columns:
-                    ref_factor = extra_df["adj_factor"].iloc[-1]
-        if ref_factor is None or (isinstance(ref_factor, float) and pd.isna(ref_factor)):
-            ref_factor = merged["adj_factor"].iloc[-1] if fq == "pre" else merged["adj_factor"].iloc[0]
-        if fq == "pre":
-            ratio = merged["adj_factor"] / ref_factor
-        else:
-            ratio = ref_factor / merged["adj_factor"]
-
-        for col in ["open", "high", "low", "close"]:
-            if col in merged.columns:
-                merged[col] = merged[col] * ratio
-
-        merged.drop(columns=["adj_factor", "_factor_date"], inplace=True, errors="ignore")
-        return merged
+        return self._apply_adjustment_with_factor(df, factor_df, fq=fq, pre_factor_ref_date=pre_factor_ref_date)
 
     def _build_adjusted_from_events(
         self,
@@ -568,18 +720,31 @@ class TushareProvider(DataProvider):
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             pro = self._ensure_client()
+            start = self._format_date(kw.get("start_date"))
+            end = self._format_date(kw.get("end_date"))
+            count = kw.get("count")
+            # 仅 count+end 时补 start，避免 trade_cal 拉全历史
+            if count and end and not start and count != -1:
+                end_dt = pd.to_datetime(end)
+                start = (end_dt - pd.Timedelta(days=int(count) * 3 + 20)).strftime("%Y%m%d")
             df = pro.trade_cal(
                 exchange="SSE",
-                start_date=self._format_date(kw.get("start_date")),
-                end_date=self._format_date(kw.get("end_date")),
+                start_date=start,
+                end_date=end,
                 fields="cal_date,is_open",
             )
             open_days = df[df["is_open"] == 1]["cal_date"].sort_values().tolist()
-            if kw.get("count") and kw["count"] != -1:
-                open_days = open_days[-kw["count"] :]
+            if count and count != -1:
+                open_days = open_days[-int(count) :]
             return open_days
 
-        date_strs = self._cache.cached_call("get_trade_days", kwargs, _fetch, result_type="list_str")
+        memo_key = f"trade_days:{kwargs.get('start_date')}:{kwargs.get('end_date')}:{kwargs.get('count')}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            date_strs = cached
+        else:
+            date_strs = self._cache.cached_call("get_trade_days", kwargs, _fetch, result_type="list_str")
+            self._memo_set(memo_key, date_strs)
         return [pd.to_datetime(d).to_pydatetime() for d in date_strs]
 
     def get_all_securities(
@@ -657,14 +822,71 @@ class TushareProvider(DataProvider):
         df["end_date"] = pd.to_datetime(df["end_date"])
         return df
 
+    def _fetch_index_weight_df(self, index_code: str, date: Optional[Union[str, datetime]] = None) -> pd.DataFrame:
+        """
+        拉取指数权重。权重多为月末更新，单日 trade_date 常空；
+        直接一次区间查询取最近一期，避免「空查 + 再查」双 RTT。
+        """
+        target_date = self._format_date(date) or datetime.today().strftime("%Y%m%d")
+        memo_key = f"idx_weight:{index_code}:{target_date}"
+
+        def _fetch() -> pd.DataFrame:
+            pro = self._ensure_client()
+            end_dt = pd.to_datetime(target_date)
+            # 覆盖至少一个调仓月；绝大多数一次命中
+            start_dt = end_dt - pd.Timedelta(days=40)
+            df = pro.index_weight(
+                index_code=index_code,
+                start_date=start_dt.strftime("%Y%m%d"),
+                end_date=target_date,
+            )
+            if df is None or df.empty:
+                start_dt = end_dt - pd.Timedelta(days=120)
+                df = pro.index_weight(
+                    index_code=index_code,
+                    start_date=start_dt.strftime("%Y%m%d"),
+                    end_date=target_date,
+                )
+            if df is None or df.empty:
+                return pd.DataFrame()
+            latest = df["trade_date"].max()
+            return df[df["trade_date"] == latest].copy()
+
+        return self._memo_call(memo_key, _fetch)
+
+    def _stock_basic_row(self, ts_code: str) -> Optional[Dict[str, Any]]:
+        """一次性缓存全市场 stock_basic，点查走本地 dict（显著加速 security_info/industry）。"""
+
+        def _load() -> Dict[str, Dict[str, Any]]:
+            pro = self._ensure_client()
+            df = pro.stock_basic(
+                exchange="",
+                list_status="L",
+                fields="ts_code,name,list_date,delist_date,industry,market",
+            )
+            if df is None or df.empty:
+                return {}
+            out: Dict[str, Dict[str, Any]] = {}
+            for row in df.itertuples(index=False):
+                out[str(row.ts_code)] = {
+                    "ts_code": str(row.ts_code),
+                    "name": getattr(row, "name", None),
+                    "list_date": getattr(row, "list_date", None),
+                    "delist_date": getattr(row, "delist_date", None),
+                    "industry": getattr(row, "industry", None),
+                    "market": getattr(row, "market", None),
+                }
+            return out
+
+        mapping = self._memo_call("stock_basic_map_L", _load)
+        return mapping.get(ts_code)
+
     def get_index_stocks(self, index_symbol: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
         kwargs = {"index_symbol": index_symbol, "date": date}
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
-            pro = self._ensure_client()
             index_code = self._to_ts_code(kw["index_symbol"])
-            target_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m%d")
-            df = pro.index_weight(index_code=index_code, trade_date=target_date)
+            df = self._fetch_index_weight_df(index_code, kw.get("date"))
             if df is None or df.empty:
                 return []
             return [self._to_jq_code(code) for code in df["con_code"].dropna().tolist()]
@@ -675,14 +897,12 @@ class TushareProvider(DataProvider):
         kwargs = {"index_id": index_id, "date": date}
 
         def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
-            pro = self._ensure_client()
             index_code = self._to_ts_code(kw["index_id"])
-            target_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m%d")
-            df = pro.index_weight(index_code=index_code, trade_date=target_date)
+            df = self._fetch_index_weight_df(index_code, kw.get("date"))
             if df is None or df.empty:
                 return pd.DataFrame(columns=["code", "weight", "date"])
             df = df.rename(columns={"con_code": "code", "trade_date": "date"})
-            df["code"] = df["code"].apply(self._to_jq_code)
+            df["code"] = df["code"].map(self._to_jq_code)
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             return df[["code", "weight", "date"]]
 
@@ -701,32 +921,79 @@ class TushareProvider(DataProvider):
             except Exception:
                 return None
 
+        _ = date
         target = self._to_jq_code(security)
-        for t in ("stock", "fund", "etf", "lof", "index"):
-            df = self.get_all_securities(types=t, date=date)
-            if df is None or df.empty or target not in df.index:
-                continue
-            row = df.loc[target]
-            if isinstance(row, pd.DataFrame):
-                row = row.iloc[0]
+        ts_code = self._to_ts_code(security)
+        memo_key = f"secinfo:{ts_code}"
+
+        def _fetch() -> Dict[str, Any]:
+            asset = self._infer_asset_by_code(target) or self._infer_asset(security)
+
+            # 股票：走本地 stock_basic 全表缓存（首次一次网络，之后近似 0 成本）
+            if asset == "E" or (asset is None):
+                row = self._stock_basic_row(ts_code)
+                if row:
+                    return {
+                        "display_name": row.get("name") or target,
+                        "name": row.get("name") or target.split(".", 1)[0],
+                        "start_date": _normalize_date(row.get("list_date")),
+                        "end_date": _normalize_date(row.get("delist_date")) or Date(2200, 1, 1),
+                        "type": "stock",
+                        "subtype": None,
+                        "parent": None,
+                        "industry": row.get("industry"),
+                    }
+
+            pro = self._ensure_client()
+            if asset == "FD" or str(security).upper().endswith(".OF"):
+                fund_code = ts_code
+                if str(security).upper().endswith(".OF") and not fund_code.upper().endswith(".OF"):
+                    fund_code = f"{fund_code.split('.')[0]}.OF"
+                for kwargs in ({"ts_code": fund_code, "market": "O"}, {"ts_code": fund_code}, {"ts_code": fund_code, "market": "E"}):
+                    try:
+                        df = pro.fund_basic(**kwargs)
+                    except Exception:
+                        continue
+                    if df is not None and not df.empty:
+                        r = df.iloc[0]
+                        return {
+                            "display_name": r.get("name") or target,
+                            "name": r.get("name") or target.split(".", 1)[0],
+                            "start_date": _normalize_date(r.get("found_date") or r.get("list_date")),
+                            "end_date": _normalize_date(r.get("delist_date")) or Date(2200, 1, 1),
+                            "type": "fund",
+                            "subtype": None,
+                            "parent": None,
+                        }
+
+            if asset == "I":
+                try:
+                    df = pro.index_basic(ts_code=ts_code)
+                    if df is not None and not df.empty:
+                        r = df.iloc[0]
+                        return {
+                            "display_name": r.get("name") or target,
+                            "name": r.get("name") or target.split(".", 1)[0],
+                            "start_date": _normalize_date(r.get("list_date") or r.get("base_date")),
+                            "end_date": Date(2200, 1, 1),
+                            "type": "index",
+                            "subtype": None,
+                            "parent": None,
+                        }
+                except Exception:
+                    pass
+
             return {
-                "display_name": row.get("display_name") or target,
-                "name": row.get("name") or target.split(".", 1)[0],
-                "start_date": _normalize_date(row.get("start_date")),
-                "end_date": _normalize_date(row.get("end_date")) or Date(2200, 1, 1),
-                "type": row.get("type") or "stock",
+                "display_name": target,
+                "name": target.split(".", 1)[0],
+                "start_date": None,
+                "end_date": Date(2200, 1, 1),
+                "type": "stock",
                 "subtype": None,
                 "parent": None,
             }
-        return {
-            "display_name": target,
-            "name": target.split(".", 1)[0],
-            "start_date": None,
-            "end_date": Date(2200, 1, 1),
-            "type": "stock",
-            "subtype": None,
-            "parent": None,
-        }
+
+        return self._memo_call(memo_key, _fetch)
 
     def get_trade_day(self, security: Union[str, List[str]], query_dt: Union[str, datetime]) -> Any:
         try:
@@ -751,30 +1018,28 @@ class TushareProvider(DataProvider):
     def get_live_current(self, security: str) -> Dict[str, Any]:
         """
         返回实盘当前快照（最小字段）基于 tushare：
-        - last_price: 当前价（回退使用最近1分钟 close）
+        - last_price: 当前价（优先 realtime / current_tick，再回退日线）
         - high_limit/low_limit: 当日涨跌停价（若可获取）
         - paused: 默认 False
-        若不可用或失败，返回空字典。
         """
         try:
-            ts = self._ensure_ts_module()
-            pro = self._ensure_client()
-            # 回退策略：使用 pro.bar/ts.pro_bar 获取最近一分钟数据
-            ts_code = self._to_ts_code(security)
-            asset = self._infer_asset(security)
-            df = ts.pro_bar(ts_code=ts_code, freq='1min', asset=asset, api=pro)
+            last_price = None
+            tick = self.get_current_tick(security)
+            if isinstance(tick, dict) and tick.get("last_price") is not None:
+                last_price = float(tick["last_price"])
+            df = self.get_price(security, count=1, frequency="daily", fq="none")
             if df is None or df.empty:
-                return {}
-            df = df.sort_values('trade_time' if 'trade_time' in df.columns else 'trade_date')
+                if last_price is None:
+                    return {}
+                return {"last_price": last_price, "high_limit": 0.0, "low_limit": 0.0, "paused": False}
             row = df.iloc[-1]
-            last_price = float(row.get('close') or 0.0)
-            high_limit = float(row.get('up_limit') or 0.0) if 'up_limit' in df.columns else 0.0
-            low_limit = float(row.get('down_limit') or 0.0) if 'down_limit' in df.columns else 0.0
+            if last_price is None:
+                last_price = float(row.get("close") or 0.0)
             return {
-                'last_price': last_price,
-                'high_limit': high_limit,
-                'low_limit': low_limit,
-                'paused': False,
+                "last_price": last_price,
+                "high_limit": float(row.get("up_limit") or row.get("high_limit") or 0.0),
+                "low_limit": float(row.get("down_limit") or row.get("low_limit") or 0.0),
+                "paused": False,
             }
         except Exception:
             return {}
@@ -905,3 +1170,827 @@ class TushareProvider(DataProvider):
             return events
 
         return self._cache.cached_call("get_split_dividend", kwargs, _fetch, result_type="list_dict")
+
+
+    @staticmethod
+    def _unit_to_frequency(unit: str) -> str:
+        u = (unit or "1d").lower()
+        mapping = {
+            "1d": "daily",
+            "d": "daily",
+            "daily": "daily",
+            "1m": "1min",
+            "1min": "1min",
+            "5m": "5min",
+            "5min": "5min",
+            "15m": "15min",
+            "15min": "15min",
+            "30m": "30min",
+            "30min": "30min",
+            "60m": "60min",
+            "60min": "60min",
+        }
+        return mapping.get(u, u)
+
+    def get_bars(
+        self,
+        security: Union[str, List[str]],
+        count: int,
+        unit: str = "1d",
+        fields: Optional[List[str]] = None,
+        include_now: bool = False,
+        end_dt: Optional[Union[str, datetime]] = None,
+        fq_ref_date: Union[int, datetime] = 1,
+        df: bool = False,
+    ) -> Any:
+        _ = include_now
+        frequency = self._unit_to_frequency(unit)
+        pre_factor_ref_date = None if isinstance(fq_ref_date, int) else fq_ref_date
+        result = self.get_price(
+            security,
+            end_date=end_dt,
+            frequency=frequency,
+            fields=fields,
+            fq="pre",
+            count=count,
+            panel=False if isinstance(security, (list, tuple)) else True,
+            pre_factor_ref_date=pre_factor_ref_date,
+        )
+        if df or isinstance(result, pd.DataFrame):
+            return result if isinstance(result, pd.DataFrame) else pd.DataFrame(result)
+        return result
+
+    def get_ticks(
+        self,
+        security: str,
+        end_dt: Union[str, datetime],
+        start_dt: Optional[Union[str, datetime]] = None,
+        count: Optional[int] = None,
+        fields: Optional[List[str]] = None,
+        skip: bool = False,
+        df: bool = False,
+    ) -> Any:
+        """
+        历史 tick：优先 ts.get_tick_data(code, date=YYYY-MM-DD, src='tt')。
+        无原生 count，先按时间窗口过滤再 tail(count)。
+        """
+        _ = skip
+        ts = self._ensure_ts_module()
+        code = self._to_ts_code(security).split(".")[0]
+        end_ts = pd.to_datetime(end_dt)
+        date_str = end_ts.strftime("%Y-%m-%d")
+        # 若 end_dt 带时刻则用其作为上界，否则默认到 15:00:00
+        if isinstance(end_dt, datetime) and (end_dt.hour or end_dt.minute or end_dt.second):
+            time_hi = end_dt.strftime("%H:%M:%S")
+        elif end_ts.hour or end_ts.minute or end_ts.second:
+            time_hi = end_ts.strftime("%H:%M:%S")
+        else:
+            time_hi = "15:00:00"
+        time_lo = None
+        if start_dt is not None:
+            start_ts = pd.to_datetime(start_dt)
+            if start_ts.normalize() == end_ts.normalize():
+                time_lo = start_ts.strftime("%H:%M:%S")
+
+        # 注意：get_tick_data 走旧版行情源（tt/nt/sn），不经过 TUSHARE_CUSTOM_URL
+        preferred = str(self._tick_src or "tt")
+        src_order = [preferred] + [s for s in ("tt", "nt", "sn") if s != preferred]
+        raw = None
+        last_err: Optional[Exception] = None
+        used_src = preferred
+        for src in src_order:
+            try:
+                cand = ts.get_tick_data(code, date=date_str, src=src)
+            except Exception as exc:
+                last_err = exc
+                continue
+            if cand is None or (isinstance(cand, pd.DataFrame) and cand.empty):
+                continue
+            raw = cand
+            used_src = src
+            break
+        if raw is None:
+            raise RuntimeError(
+                f"get_tick_data 无数据 code={code} date={date_str} src={src_order}"
+                + (f" ({last_err})" if last_err else "；该接口不走自定义 pro 代理，依赖 tt/nt/sn 外网源")
+            )
+        _ = used_src
+        out = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
+        if "time" in out.columns:
+            times = out["time"].astype(str)
+            if time_lo:
+                out = out[times >= time_lo]
+                times = out["time"].astype(str)
+            out = out[times <= time_hi]
+        if fields:
+            keep = [c for c in fields if c in out.columns]
+            if keep:
+                out = out[keep]
+        if count:
+            out = out.tail(int(count))
+        out = out.reset_index(drop=True)
+        return out if df else out.to_dict(orient="records")
+
+    def get_current_tick(
+        self,
+        security: str,
+        dt: Optional[Union[str, datetime]] = None,
+        df: bool = False,
+    ) -> Optional[Any]:
+        _ = dt
+        ts = self._ensure_ts_module()
+        ts_code = self._to_ts_code(security)
+        code = ts_code.split(".")[0]
+        tick: Optional[Dict[str, Any]] = None
+
+        # 1) 旧版实时行情
+        try:
+            quotes = ts.get_realtime_quotes(code)
+            if quotes is not None and not quotes.empty:
+                row = quotes.iloc[0]
+                tick = {
+                    "code": security,
+                    "last_price": float(row.get("price") or 0.0),
+                    "volume": float(row.get("volume") or 0.0),
+                    "money": float(row.get("amount") or 0.0),
+                    "time": row.get("time"),
+                    "date": row.get("date"),
+                }
+        except Exception:
+            tick = None
+
+        # 2) 回退最近日线收盘
+        if tick is None:
+            try:
+                hist = self.get_price(security, count=1, frequency="daily", fq="none")
+                if hist is not None and not hist.empty:
+                    row = hist.iloc[-1]
+                    tick = {
+                        "code": security,
+                        "last_price": float(row.get("close") or 0.0),
+                        "volume": float(row.get("volume") or 0.0),
+                        "money": float(row.get("money") or 0.0),
+                        "time": None,
+                        "date": str(hist.index[-1].date()) if hasattr(hist.index[-1], "date") else None,
+                    }
+            except Exception:
+                return None if not df else pd.DataFrame()
+
+        if tick is None:
+            return None if not df else pd.DataFrame()
+        return pd.DataFrame([tick]) if df else tick
+
+    def get_extras(
+        self,
+        info: str,
+        security_list: List[str],
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        df: bool = True,
+        count: Optional[int] = None,
+    ) -> Any:
+        info_key = (info or "").lower()
+        securities = list(security_list or [])
+        days = self.get_trade_days(start_date=start_date, end_date=end_date, count=count)
+        if not days:
+            return pd.DataFrame() if df else {}
+
+        if info_key == "is_st":
+            name_map: Dict[str, str] = {}
+            for sec in securities:
+                try:
+                    meta = self.get_security_info(sec)
+                    name_map[sec] = str(meta.get("display_name") or meta.get("name") or "")
+                except Exception:
+                    name_map[sec] = ""
+            data = {
+                sec: [("ST" in name_map.get(sec, "").upper()) for _ in days]
+                for sec in securities
+            }
+            frame = pd.DataFrame(data, index=pd.to_datetime(days))
+            return frame if df else frame.to_dict(orient="list")
+
+        raise NotImplementedError(f"Tushare get_extras 暂不支持 info={info}")
+
+    def _daily_basic_valuation(self, trade_date: str) -> pd.DataFrame:
+        memo_key = f"daily_basic:{trade_date}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
+
+        def _fetch(_kw: Dict[str, Any]) -> pd.DataFrame:
+            pro = self._ensure_client()
+            # 精简字段，降低代理传输
+            df = pro.daily_basic(
+                trade_date=trade_date,
+                fields="ts_code,trade_date,total_mv,circ_mv,pe,pb",
+            )
+            if df is None or df.empty:
+                return pd.DataFrame(
+                    columns=["code", "market_cap", "circulating_market_cap", "pe_ratio", "pb_ratio", "day"]
+                )
+            # 向量化后缀替换，避免逐行 Python map
+            codes = df["ts_code"].astype(str).str.replace(".SH", ".XSHG", regex=False)
+            codes = codes.str.replace(".SZ", ".XSHE", regex=False)
+            return pd.DataFrame(
+                {
+                    "code": codes,
+                    "market_cap": pd.to_numeric(df["total_mv"], errors="coerce") / 10000.0,
+                    "circulating_market_cap": pd.to_numeric(df["circ_mv"], errors="coerce") / 10000.0,
+                    "pe_ratio": pd.to_numeric(df.get("pe"), errors="coerce"),
+                    "pb_ratio": pd.to_numeric(df.get("pb"), errors="coerce"),
+                    "day": pd.to_datetime(df["trade_date"], errors="coerce"),
+                }
+            )
+
+        out = self._cache.cached_call(
+            "daily_basic_valuation",
+            {"trade_date": trade_date},
+            _fetch,
+            result_type="df",
+        )
+        return self._memo_set(memo_key, out)
+
+    def get_fundamentals(
+        self,
+        query_object: Any,
+        date: Optional[Union[str, datetime]] = None,
+        statDate: Optional[str] = None,
+    ) -> Any:
+        """
+        对齐 jq get_fundamentals 的常用估值字段（market_cap 等）。
+        query_object 可为 None / dict / jq query（过滤条件尽力忽略，由调用方再筛）。
+        """
+        _ = query_object, statDate
+        trade_date = self._format_date(date)
+        if not trade_date:
+            last = self._latest_trade_day()
+            trade_date = self._format_date(last) or datetime.today().strftime("%Y%m%d")
+        return self._daily_basic_valuation(trade_date)
+
+    def get_fundamentals_continuously(
+        self,
+        query_object: Any,
+        end_date: Optional[Union[str, datetime]] = None,
+        count: int = 1,
+        panel: bool = True,
+    ) -> Any:
+        _ = query_object, panel
+        days = self.get_trade_days(end_date=end_date, count=max(int(count or 1), 1))
+        trade_dates = [self._format_date(day) for day in days]
+        trade_dates = [d for d in trade_dates if d]
+        if not trade_dates:
+            return pd.DataFrame()
+
+        # 先吃 mem/disk 命中，仅对未命中日期打网；冷启动并行
+        frames: List[pd.DataFrame] = []
+        missing: List[str] = []
+        for d in trade_dates:
+            hit, cached = self._memo_get(f"daily_basic:{d}")
+            if hit and cached is not None and not getattr(cached, "empty", False):
+                frames.append(cached)
+            else:
+                missing.append(d)
+
+        if missing:
+            max_workers = min(4, len(missing))
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futs = {pool.submit(self._daily_basic_valuation, d): d for d in missing}
+                    for fut in as_completed(futs):
+                        part = fut.result()
+                        if part is not None and not part.empty:
+                            frames.append(part)
+            except Exception:
+                for d in missing:
+                    part = self._daily_basic_valuation(d)
+                    if part is not None and not part.empty:
+                        frames.append(part)
+
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames, ignore_index=True)
+        if "day" in out.columns:
+            out = out.sort_values("day")
+        return out
+
+    def _sw_member_table(self) -> pd.DataFrame:
+        """
+        申万成分全表（代理上 index_member 不存在，index_member_all 常忽略 index_code）。
+        全表缓存后本地按 l1/l2/l3_code 过滤。
+        """
+        memo_key = "sw_member_all_table"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
+
+        def _fetch(_kw: Dict[str, Any]) -> pd.DataFrame:
+            pro = self._ensure_client()
+            try:
+                df = pro.index_member_all()
+            except Exception:
+                try:
+                    df = pro.index_member_all(index_code="801010.SI")
+                except Exception:
+                    return pd.DataFrame()
+            return df if df is not None else pd.DataFrame()
+
+        df = self._cache.cached_call("sw_member_all", {}, _fetch, result_type="df")
+        return self._memo_set(memo_key, df)
+
+    def get_industry_stocks(self, industry_code: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
+        """行业成分股：申万代码（如 801010.SI）本地过滤当前成分。"""
+        _ = date
+        code = str(industry_code or "").strip()
+        if code.upper().startswith("HY"):
+            def _sw_l1_first() -> str:
+                def _fetch_classify() -> str:
+                    try:
+                        pro = self._ensure_client()
+                        classify = pro.index_classify(level="L1", src="SW2021")
+                        if classify is not None and not classify.empty:
+                            return str(classify.iloc[0].get("index_code") or "")
+                    except Exception:
+                        return ""
+                    return ""
+
+                return self._memo_call("sw_l1_first", _fetch_classify)
+
+            code = _sw_l1_first()
+        if not code:
+            return []
+
+        memo_key = f"industry_stocks:{code}"
+
+        def _fetch() -> List[str]:
+            df = self._sw_member_table()
+            if df is None or df.empty:
+                return []
+            mask = pd.Series(False, index=df.index)
+            for col in ("l1_code", "l2_code", "l3_code", "index_code"):
+                if col in df.columns:
+                    mask = mask | (df[col].astype(str) == code)
+            df = df.loc[mask]
+            if df.empty:
+                return []
+            if "is_new" in df.columns:
+                cur = df[df["is_new"].astype(str).str.upper() == "Y"]
+                if not cur.empty:
+                    df = cur
+            col = "ts_code" if "ts_code" in df.columns else ("con_code" if "con_code" in df.columns else None)
+            if not col:
+                return []
+            codes = df[col].dropna().astype(str)
+            codes = codes.str.replace(".SH", ".XSHG", regex=False).str.replace(".SZ", ".XSHE", regex=False)
+            return codes.tolist()
+
+        return self._memo_call(memo_key, _fetch)
+
+    def get_industry(self, security: Union[str, List[str]], date: Optional[Union[str, datetime]] = None) -> Any:
+        _ = date
+        securities = security if isinstance(security, (list, tuple, set)) else [security]
+        result: Dict[str, Any] = {}
+        for sec in securities:
+            ts_code = self._to_ts_code(str(sec))
+            industry_info: Dict[str, Any] = {}
+            row = self._stock_basic_row(ts_code)
+            if row and row.get("industry"):
+                industry_info["jq_l1"] = {
+                    "industry_code": None,
+                    "industry_name": row.get("industry"),
+                }
+            result[str(sec)] = industry_info
+        return result
+
+    @staticmethod
+    def _is_unsupported_api_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return ("接口不存在" in msg) or ("请指定正确的接口名" in msg) or ("该接口" in msg and "不存在" in msg)
+
+    def _concept_api_enabled(self) -> bool:
+        hit, val = self._memo_get("concept_api_enabled")
+        if hit:
+            return bool(val)
+        # 未知时先当作可用，真正调用失败后再标记
+        return True
+
+    def _mark_concept_api(self, enabled: bool) -> None:
+        self._memo_set("concept_api_enabled", bool(enabled))
+
+    def _concept_catalog(self) -> pd.DataFrame:
+        """概念列表（轻量），用于校验/回退 concept_code。"""
+        if not self._concept_api_enabled():
+            return pd.DataFrame()
+
+        def _fetch() -> pd.DataFrame:
+            pro = self._ensure_client()
+            try:
+                df = pro.concept(src="ts")
+            except Exception as exc:
+                if self._is_unsupported_api_error(exc):
+                    self._mark_concept_api(False)
+                return pd.DataFrame()
+            return df if df is not None else pd.DataFrame()
+
+        return self._memo_call("concept_catalog", _fetch)
+
+    def _normalize_concept_code(self, concept_code: str) -> str:
+        code = str(concept_code or "").strip()
+        if not code or code.upper() in {"TS0", "NONE", "NULL"}:
+            cat = self._concept_catalog()
+            if cat is not None and not cat.empty:
+                for col in ("code", "id", "concept_code"):
+                    if col in cat.columns and pd.notna(cat.iloc[0].get(col)):
+                        return str(cat.iloc[0][col])
+            return ""
+        return code
+
+    def get_concept_stocks(self, concept_code: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
+        _ = date
+        if not self._concept_api_enabled():
+            return []
+        code = self._normalize_concept_code(concept_code)
+        if not code:
+            return []
+        memo_key = f"concept_stocks:{code}"
+
+        def _fetch() -> List[str]:
+            pro = self._ensure_client()
+            try:
+                df = pro.concept_detail(id=code)
+            except Exception as exc:
+                if self._is_unsupported_api_error(exc):
+                    self._mark_concept_api(False)
+                return []
+            if df is None or df.empty or "ts_code" not in df.columns:
+                return []
+            return [self._to_jq_code(c) for c in df["ts_code"].dropna().tolist()]
+
+        return self._memo_call(memo_key, _fetch)
+
+    def get_concept(self, security: Union[str, List[str]], date: Optional[Union[str, datetime]] = None) -> Any:
+        _ = date
+        securities = list(security if isinstance(security, (list, tuple, set)) else [security])
+        empty = {str(sec): {"jq_concept": []} for sec in securities}
+        if not self._concept_api_enabled():
+            return empty
+
+        result: Dict[str, Any] = {}
+        pro = self._ensure_client()
+        for sec in securities:
+            ts_code = self._to_ts_code(str(sec))
+            memo_key = f"concept:{ts_code}"
+
+            def _fetch(code: str = ts_code) -> List[Dict[str, Any]]:
+                try:
+                    try:
+                        df = pro.concept_detail(
+                            ts_code=code,
+                            fields="id,concept_name,ts_code,name",
+                        )
+                    except TypeError:
+                        df = pro.concept_detail(ts_code=code)
+                except Exception as exc:
+                    if self._is_unsupported_api_error(exc):
+                        self._mark_concept_api(False)
+                    return []
+                if df is None or df.empty:
+                    return []
+                id_col = "id" if "id" in df.columns else ("concept_code" if "concept_code" in df.columns else None)
+                name_col = "concept_name" if "concept_name" in df.columns else ("name" if "name" in df.columns else None)
+                codes = df[id_col].astype(str).tolist() if id_col else [None] * len(df)
+                names = df[name_col].astype(str).tolist() if name_col else [None] * len(df)
+                return [{"concept_code": c, "concept_name": n} for c, n in zip(codes, names)]
+
+            concepts = self._memo_call(memo_key, _fetch)
+            result[str(sec)] = {"jq_concept": concepts}
+        return result
+
+    def get_fund_info(self, security: str, date: Optional[Union[str, datetime]] = None) -> Any:
+        _ = date
+        ts_code = self._to_ts_code(security)
+        if str(security).upper().endswith(".OF") and not ts_code.upper().endswith(".OF"):
+            ts_code = f"{security.split('.')[0]}.OF"
+        elif not ts_code.upper().endswith((".OF", ".SH", ".SZ")):
+            # 裸代码默认按场外基金试
+            ts_code = f"{ts_code}.OF"
+        memo_key = f"fund_info:{ts_code}"
+
+        def _fetch() -> Dict[str, Any]:
+            pro = self._ensure_client()
+            df = None
+            # 场外优先 market='O'，避免无效代码空转
+            trials = []
+            if ts_code.upper().endswith(".OF"):
+                trials = [{"ts_code": ts_code, "market": "O"}, {"ts_code": ts_code}]
+            else:
+                trials = [{"ts_code": ts_code, "market": "E"}, {"ts_code": ts_code}]
+            try:
+                for kwargs in trials:
+                    df = pro.fund_basic(**kwargs)
+                    if df is not None and not df.empty:
+                        break
+            except Exception as exc:
+                raise RuntimeError(f"get_fund_info 失败: {exc}") from exc
+            if df is None or df.empty:
+                return {}
+            row = df.iloc[0].to_dict()
+            return {
+                "fund_name": row.get("name"),
+                "fund_type": row.get("fund_type"),
+                "start_date": row.get("found_date") or row.get("list_date"),
+                "end_date": row.get("delist_date"),
+                "advisor": row.get("management"),
+                "trustee": row.get("custodian"),
+                "raw": row,
+            }
+
+        return self._memo_call(memo_key, _fetch)
+
+    def _margin_stocks(self, date: Optional[Union[str, datetime]] = None) -> List[str]:
+        trade_date = self._format_date(date)
+        if not trade_date:
+            last = self._latest_trade_day()
+            trade_date = self._format_date(last) or datetime.today().strftime("%Y%m%d")
+        memo_key = f"margin_secs:{trade_date}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
+
+        def _fetch(_kw: Dict[str, Any]) -> List[str]:
+            pro = self._ensure_client()
+            api = getattr(pro, "margin_secs", None)
+            if api is None:
+                return []
+            try:
+                df = api(trade_date=trade_date)
+            except Exception:
+                return []
+            if df is None or df.empty or "ts_code" not in df.columns:
+                return []
+            codes = df["ts_code"].dropna().astype(str)
+            codes = codes.str.replace(".SH", ".XSHG", regex=False).str.replace(".SZ", ".XSHE", regex=False)
+            return sorted(codes.unique().tolist())
+
+        out = self._cache.cached_call(
+            "margin_secs",
+            {"trade_date": trade_date},
+            _fetch,
+            result_type="list_str",
+        )
+        return self._memo_set(memo_key, out)
+
+    def get_margincash_stocks(self, date: Optional[Union[str, datetime]] = None) -> Any:
+        return self._margin_stocks(date)
+
+    def get_marginsec_stocks(self, date: Optional[Union[str, datetime]] = None) -> Any:
+        # 与融资标的同源接口，直接复用记忆缓存
+        return self._margin_stocks(date)
+
+    def get_dominant_future(self, underlying_symbol: str, date: Optional[Union[str, datetime]] = None) -> Any:
+        pro = self._ensure_client()
+        trade_date = self._format_date(date) or datetime.today().strftime("%Y%m%d")
+        symbol = str(underlying_symbol or "").upper()
+        # IF -> IF.CFX 等
+        ts_code = symbol if "." in symbol else f"{symbol}.CFX"
+        try:
+            if hasattr(pro, "fut_mapping"):
+                df = pro.fut_mapping(ts_code=ts_code, trade_date=trade_date)
+                if df is not None and not df.empty:
+                    col = "mapping_ts_code" if "mapping_ts_code" in df.columns else "ts_code"
+                    return str(df.iloc[0][col])
+            if hasattr(pro, "fut_dominant"):
+                df = pro.fut_dominant(original=symbol, trade_date=trade_date)
+                if df is not None and not df.empty:
+                    return str(df.iloc[0].get("ts_code") or df.iloc[0].get("dominant"))
+        except Exception as exc:
+            raise RuntimeError(f"get_dominant_future 失败: {exc}") from exc
+        return None
+
+    def _fut_basic_table(self, exchange: str) -> pd.DataFrame:
+        memo_key = f"fut_basic:{exchange or 'ALL'}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
+
+        def _fetch(_kw: Dict[str, Any]) -> pd.DataFrame:
+            pro = self._ensure_client()
+            try:
+                df = pro.fut_basic(exchange=exchange, fut_type="1") if exchange else pro.fut_basic(fut_type="1")
+            except Exception:
+                return pd.DataFrame()
+            return df if df is not None else pd.DataFrame()
+
+        df = self._cache.cached_call(
+            "fut_basic",
+            {"exchange": exchange or "", "fut_type": "1"},
+            _fetch,
+            result_type="df",
+        )
+        return self._memo_set(memo_key, df)
+
+    def get_future_contracts(self, underlying_symbol: str, date: Optional[Union[str, datetime]] = None) -> Any:
+        symbol = str(underlying_symbol or "").upper()
+        exchange = "CFFEX" if symbol in {"IF", "IH", "IC", "IM", "T", "TF", "TS"} else ""
+        date_str = self._format_date(date)
+        memo_key = f"fut_contracts:{exchange}:{symbol}:{date_str}"
+
+        def _fetch() -> List[str]:
+            df = self._fut_basic_table(exchange)
+            if df is None or df.empty:
+                return []
+            out = df
+            if symbol:
+                if "fut_code" in out.columns:
+                    out = out[out["fut_code"].astype(str).str.upper() == symbol]
+                else:
+                    out = out[out["ts_code"].astype(str).str.upper().str.startswith(symbol)]
+            if date_str and not out.empty:
+                # 仅保留在查询日仍挂牌的合约
+                if "list_date" in out.columns:
+                    listed = out["list_date"].astype(str).fillna("")
+                    out = out[(listed == "") | (listed <= date_str)]
+                if "delist_date" in out.columns:
+                    delist = out["delist_date"].astype(str).fillna("")
+                    out = out[(delist == "") | (delist == "None") | (delist >= date_str)]
+            if out.empty:
+                return []
+            return [str(c) for c in out["ts_code"].dropna().tolist()]
+
+        return self._memo_call(memo_key, _fetch)
+
+    def get_billboard_list(
+        self,
+        stock_list: Optional[List[str]] = None,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        count: Optional[int] = None,
+    ) -> Any:
+        """
+        龙虎榜。该代理 top_list 必填 trade_date；带 ts_code 时可能一次返回该股历史上榜。
+        策略：单次 trade_date+ts_code，本地按日期过滤，并做 mem/disk 缓存。
+        """
+        pro = self._ensure_client()
+        start_str = self._format_date(start_date)
+        end_str = self._format_date(end_date)
+        if count and not start_str and end_str:
+            days = self.get_trade_days(end_date=end_date, count=count)
+            if days:
+                start_str = self._format_date(days[0])
+        if not end_str:
+            end_str = datetime.today().strftime("%Y%m%d")
+
+        def _filter_dates(df: pd.DataFrame) -> pd.DataFrame:
+            if df is None or df.empty or "trade_date" not in df.columns:
+                return df if df is not None else pd.DataFrame()
+            td = df["trade_date"].astype(str)
+            if start_str:
+                df = df[td >= start_str]
+                td = df["trade_date"].astype(str)
+            if end_str:
+                df = df[td <= end_str]
+            return df
+
+        if stock_list:
+            frames = []
+            for sec in stock_list:
+                ts_code = self._to_ts_code(sec)
+                memo_key = f"top_list:{ts_code}:{start_str}:{end_str}"
+                hit, cached = self._memo_get(memo_key)
+                if hit:
+                    if cached is not None and not getattr(cached, "empty", True):
+                        frames.append(cached)
+                    continue
+
+                def _fetch(_kw: Dict[str, Any], code: str = ts_code) -> pd.DataFrame:
+                    # 1) 单次：trade_date + ts_code（代理上 ~1s，可能含历史）
+                    try:
+                        part = pro.top_list(trade_date=end_str, ts_code=code)
+                    except Exception:
+                        part = None
+                    if part is None or part.empty:
+                        # 2) 回退：最多 3 个交易日，避免 5×RTT
+                        days = self.get_trade_days(start_date=start_str, end_date=end_str)
+                        if len(days) > 3:
+                            days = days[-3:]
+                        chunks = []
+                        for day in days:
+                            trade_date = self._format_date(day)
+                            try:
+                                chunk = pro.top_list(trade_date=trade_date, ts_code=code)
+                            except Exception:
+                                continue
+                            if chunk is not None and not chunk.empty:
+                                chunks.append(chunk)
+                        part = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+                    part = _filter_dates(part)
+                    if part is not None and not part.empty and "ts_code" in part.columns:
+                        part = part.copy()
+                        part["code"] = part["ts_code"].map(self._to_jq_code)
+                    return part if part is not None else pd.DataFrame()
+
+                part = self._cache.cached_call(
+                    "top_list_stock",
+                    {"ts_code": ts_code, "start_date": start_str, "end_date": end_str},
+                    _fetch,
+                    result_type="df",
+                )
+                self._memo_set(memo_key, part)
+                if part is not None and not part.empty:
+                    frames.append(part)
+            if not frames:
+                return pd.DataFrame()
+            return pd.concat(frames, ignore_index=True)
+
+        # 全市场：只取 end 日前最多 3 日
+        days = self.get_trade_days(start_date=start_str, end_date=end_str)
+        if len(days) > 3:
+            days = days[-3:]
+        frames = []
+        for day in days:
+            trade_date = self._format_date(day)
+            memo_key = f"top_list:ALL:{trade_date}"
+
+            def _fetch_day(_kw: Dict[str, Any], td: str = trade_date) -> pd.DataFrame:
+                try:
+                    return pro.top_list(trade_date=td)
+                except Exception:
+                    return pd.DataFrame()
+
+            part = self._memo_call(
+                memo_key,
+                lambda: self._cache.cached_call(
+                    "top_list_day",
+                    {"trade_date": trade_date},
+                    _fetch_day,
+                    result_type="df",
+                ),
+            )
+            if part is not None and not part.empty:
+                frames.append(part)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        df = _filter_dates(df)
+        if "ts_code" in df.columns:
+            df = df.copy()
+            df["code"] = df["ts_code"].map(self._to_jq_code)
+        return df
+
+    def get_locked_shares(
+        self,
+        stock_list: List[str],
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        forward_count: Optional[int] = None,
+    ) -> Any:
+        _ = forward_count
+        start_str = self._format_date(start_date)
+        end_str = self._format_date(end_date)
+        frames = []
+        pro = self._ensure_client()
+        for sec in stock_list or []:
+            ts_code = self._to_ts_code(sec)
+            memo_key = f"share_float:{ts_code}:{start_str}:{end_str}"
+
+            def _fetch(code: str = ts_code) -> pd.DataFrame:
+                try:
+                    part = pro.share_float(ts_code=code, start_date=start_str, end_date=end_str)
+                except Exception:
+                    return pd.DataFrame()
+                if part is None or part.empty:
+                    return pd.DataFrame()
+                return part
+
+            part = self._memo_call(memo_key, _fetch)
+            if part is not None and not part.empty:
+                part = part.copy()
+                part["code"] = self._to_jq_code(sec)
+                frames.append(part)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def subscribe_ticks(self, symbols: List[str]) -> None:
+        """
+        订阅指定标的 tick（可选实现）。默认不操作。
+        """
+        return None
+
+    def subscribe_markets(self, markets: List[str]) -> None:
+        """
+        订阅市场级 tick（可选实现，如 ['SH','SZ']）。默认不操作。
+        """
+        return None
+
+    def unsubscribe_ticks(self, symbols: Optional[List[str]] = None) -> None:
+        """
+        取消 tick 订阅（可选实现）。symbols 为 None 表示全部取消。默认不操作。
+        """
+        return None
+
+    def unsubscribe_markets(self, markets: Optional[List[str]] = None) -> None:
+        """
+        取消市场级 tick 订阅（可选实现）。默认不操作。
+        """
+        return None

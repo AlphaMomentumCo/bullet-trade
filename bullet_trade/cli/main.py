@@ -147,7 +147,7 @@ def create_parser():
         "--backtest-data-session",
         dest="backtest_data_session",
         action="store_true",
-        help="启用回测数据会话优化（默认关闭，仅影响回测）",
+        help="启用回测数据会话优化（默认关闭；开启时默认同时启用行情块缓存）",
     )
     backtest_parser.add_argument(
         "--backtest-data-session-manifest",
@@ -167,7 +167,7 @@ def create_parser():
         "--backtest-price-block-cache",
         dest="backtest_price_block_cache",
         action="store_true",
-        help="启用回测内存行情块缓存（默认关闭；动态前复权会自动降级）",
+        help="启用回测内存行情块缓存（默认关闭；与 --backtest-data-session 联用时会话侧已默认开启）",
     )
     backtest_parser.set_defaults(
         generate_images=False,

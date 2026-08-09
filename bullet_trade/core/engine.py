@@ -176,6 +176,7 @@ class BacktestEngine:
         self._benchmark_base_price: Optional[float] = None
         self._trade_calendar: Dict[date, Dict[str, Any]] = {}
         self._trade_seq = 0
+        self._bar_exec_price_cache: Dict[Tuple[Any, ...], float] = {}
         market_cfg = get_live_trade_config()
         self._market_buy_percent = float(
             market_cfg.get("market_buy_price_percent", _DEFAULT_MARKET_BUY_PERCENT)
@@ -997,6 +998,7 @@ class BacktestEngine:
         """执行单个交易日的调度与撮合流程。"""
         if not market_periods:
             raise ValueError("交易时段配置不能为空")
+        self._bar_exec_price_cache.clear()
 
         resolver = lambda _ref=None: market_periods
         schedule_map = generate_daily_schedule(
@@ -1583,7 +1585,11 @@ class BacktestEngine:
             pass
 
     def _resolve_base_exec_price(
-        self, security: str, current_dt: datetime, fq_mode: str
+        self,
+        security: str,
+        current_dt: datetime,
+        fq_mode: str,
+        hint_last_price: Optional[float] = None,
     ) -> Optional[float]:
         """根据时间窗口解析撮合的基准价。
         - 09:25-09:30: 当日未复权开盘价
@@ -1591,30 +1597,25 @@ class BacktestEngine:
         - 其他时段: 未复权日收盘价
         返回 None 表示无法获取。
         """
+        cache_key = (security, current_dt, fq_mode)
+        cached = self._bar_exec_price_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # use_real_price(pre) 路径下，current_data.last_price 已是前复权最新价，可避免二次远程取价
+        if fq_mode == "pre" and hint_last_price is not None:
+            try:
+                hint = float(hint_last_price)
+            except (TypeError, ValueError):
+                hint = 0.0
+            if hint > 0:
+                self._bar_exec_price_cache[cache_key] = hint
+                return hint
+
+        price: Optional[float] = None
         try:
             t = current_dt.time() if isinstance(current_dt, datetime) else None
             if t and (Time(9, 25) <= t < Time(9, 31)):
-                # # 优先尝试 09:30 分钟价（若存在），否则回退到日开
-                # try:
-                #     dfm = api_get_price(
-                #         security=security,
-                #         end_date=current_dt,
-                #         frequency='minute',
-                #         fields=['close'],
-                #         count=1,
-                #         fq=fq_mode
-                #     )
-                #     if not dfm.empty:
-                #         rowm = dfm.iloc[-1]
-                #         if isinstance(dfm.index, pd.DatetimeIndex):
-                #             last_ts = dfm.index[-1]
-                #             # 若最后一行时间早于当前时间，仍可作为近似基准
-                #             if last_ts <= pd.Timestamp(current_dt):
-                #                 val = float(rowm.get('close') or 0.0)
-                #                 if val > 0:
-                #                     return val
-                # except Exception:
-                #     pass
                 dfp = api_get_price(
                     security=security,
                     end_date=current_dt,
@@ -1625,7 +1626,7 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("open") or 0.0)
+                    price = float(rowp.get("open") or 0.0)
             elif t and (Time(9, 31) <= t < Time(15, 0)):
                 dfp = api_get_price(
                     security=security,
@@ -1637,7 +1638,7 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
+                    price = float(rowp.get("close") or 0.0)
             else:
                 dfp = api_get_price(
                     security=security,
@@ -1649,9 +1650,13 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
+                    price = float(rowp.get("close") or 0.0)
         except Exception:
             return None
+
+        if price is not None and price > 0:
+            self._bar_exec_price_cache[cache_key] = price
+            return price
         return None
 
     def _load_corporate_actions(
@@ -1849,7 +1854,12 @@ class BacktestEngine:
 
                 # 解析执行价基准（封装逻辑便于维护与测试）
                 current_dt = self.context.current_dt
-                base_exec_price = self._resolve_base_exec_price(order.security, current_dt, fq_mode)
+                base_exec_price = self._resolve_base_exec_price(
+                    order.security,
+                    current_dt,
+                    fq_mode,
+                    hint_last_price=security_data.last_price,
+                )
 
                 current_price = (
                     float(base_exec_price)
@@ -2294,40 +2304,100 @@ class BacktestEngine:
 
         return order.amount if order.is_buy else -order.amount
 
+    @staticmethod
+    def _close_map_from_price_df(df: pd.DataFrame, securities: Sequence[str]) -> Dict[str, float]:
+        """从 batch get_price(panel=False) 结果提取各标的收盘价。"""
+        close_map: Dict[str, float] = {}
+        if df is None or getattr(df, "empty", True):
+            return close_map
+
+        code_col = None
+        for candidate in ("code", "security", "ts_code"):
+            if candidate in df.columns:
+                code_col = candidate
+                break
+
+        if code_col is not None and "close" in df.columns:
+            for _, row in df.iterrows():
+                sec = str(row.get(code_col) or "")
+                if not sec:
+                    continue
+                try:
+                    val = float(row.get("close") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0:
+                    close_map[sec] = val
+            return close_map
+
+        # panel=True / 宽表回退：按列名匹配
+        for security in securities:
+            try:
+                if "close" in df.columns and len(securities) == 1:
+                    val = float(df["close"].iloc[-1])
+                elif security in df.columns:
+                    val = float(df[security].iloc[-1])
+                elif ("close", security) in df.columns:
+                    val = float(df[("close", security)].iloc[-1])
+                else:
+                    continue
+            except Exception:
+                continue
+            if val > 0:
+                close_map[security] = val
+        return close_map
+
     def _update_positions(self):
         """更新持仓价格（使用收盘价）"""
         if not self.context.portfolio.positions:
             return
 
-        for security in list(self.context.portfolio.positions.keys()):
-            try:
-                df = api_get_price(
-                    security=security,
-                    end_date=self.context.current_dt,
-                    frequency="daily",
-                    fields=["close"],
-                    count=1,
-                    fq="none",
-                )
-                if df.empty:
+        securities = list(self.context.portfolio.positions.keys())
+        close_map: Dict[str, float] = {}
+        try:
+            df = api_get_price(
+                security=securities,
+                end_date=self.context.current_dt,
+                frequency="daily",
+                fields=["close"],
+                count=1,
+                fq="none",
+                panel=False,
+            )
+            close_map = self._close_map_from_price_df(df, securities)
+        except Exception as e:
+            log.debug(f"批量更新持仓价格失败，将逐标的回退: {e}")
+
+        for security in securities:
+            close_price = close_map.get(security)
+            if close_price is None or not (close_price > 0):
+                try:
+                    df = api_get_price(
+                        security=security,
+                        end_date=self.context.current_dt,
+                        frequency="daily",
+                        fields=["close"],
+                        count=1,
+                        fq="none",
+                    )
+                    if df.empty:
+                        continue
+                    last_row = df.iloc[-1]
+                    if "close" in df.columns:
+                        close_price = last_row["close"]
+                    elif security in df.columns:
+                        close_price = last_row[security]
+                    elif ("close", security) in df.columns:
+                        close_price = last_row[("close", security)]
+                    else:
+                        log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
+                        continue
+                except Exception as e:
+                    log.debug(f"更新{security}价格失败: {e}")
                     continue
 
-                last_row = df.iloc[-1]
-                close_price = None
-                if "close" in df.columns:
-                    close_price = last_row["close"]
-                elif security in df.columns:
-                    close_price = last_row[security]
-                elif ("close", security) in df.columns:
-                    close_price = last_row[("close", security)]
-                else:
-                    log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
-                    continue
-
-                if pd.notna(close_price) and close_price > 0:
-                    self.context.portfolio.positions[security].update_price(float(close_price))
-            except Exception as e:
-                log.debug(f"更新{security}价格失败: {e}")
+            if pd.notna(close_price) and close_price > 0:
+                self.context.portfolio.positions[security].update_price(float(close_price))
 
         self.context.portfolio.update_value()
 

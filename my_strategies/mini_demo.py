@@ -127,4 +127,4 @@ def notify_trade_fills(context):
         if trade_id in g.notified_trade_ids:
             continue
         g.notified_trade_ids.add(trade_id)
-        send_msg(_format_trade_message(context, trade))
+        # send_msg(_format_trade_message(context, trade))

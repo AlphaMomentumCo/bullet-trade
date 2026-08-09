@@ -66,7 +66,12 @@ def run_backtest(args):
         print("回测数据会话优化: 启用")
     else:
         print("回测数据会话优化: 默认/环境变量")
-    print(f"内存行情块缓存: {'启用' if getattr(args, 'backtest_price_block_cache', False) else '关闭'}")
+    if getattr(args, "backtest_data_session", False):
+        print("内存行情块缓存: 启用（随数据会话默认开启）")
+    else:
+        print(
+            f"内存行情块缓存: {'启用' if getattr(args, 'backtest_price_block_cache', False) else '关闭'}"
+        )
     if getattr(args, "auto_report", False):
         print(f"自动报告: 是 ({getattr(args, 'report_format', 'html').upper()})")
     else:
@@ -88,9 +93,8 @@ def run_backtest(args):
             data_session_config = {
                 "enabled": True,
                 "manifest_path": manifest_path,
-                "price_block_cache_enabled": bool(
-                    getattr(args, "backtest_price_block_cache", False)
-                ),
+                # 开启数据会话时默认启用行情块缓存（可用 --backtest-price-block-cache 显式打开）
+                "price_block_cache_enabled": True,
             }
             max_bytes = getattr(args, "backtest_data_session_max_bytes", None)
             if max_bytes is not None:

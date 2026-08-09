@@ -38,6 +38,7 @@ class DataProvider(ABC):
         pass
 
 
+
     @abstractmethod
     def get_trade_days(
         self,
