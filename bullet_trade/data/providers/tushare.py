@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date as Date
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
 from .base import DataProvider
+from .tushare_clickhouse import TushareClickHouseClient, build_clickhouse_client
 from ..cache import CacheManager
 
 
 class TushareProvider(DataProvider):
-    """基于 tushare.pro 的数据提供者，字段与复权口径对齐兼容层约定。"""
+    """基于 tushare.pro 的数据提供者，字段与复权口径对齐兼容层约定。
+
+    可选 ClickHouse 热链路（Docker + tushare-integration 入库）：日线 / 复权因子 /
+    交易日历 / 基础信息等优先读本地库，未命中再回退远程 API。
+    """
 
     name: str = "tushare"
-    _TS_SUFFIX_TO_JQ = {"SH": "XSHG", "SZ": "XSHE"}
-    _JQ_SUFFIX_TO_TS = {"XSHG": "SH", "XSHE": "SZ"}
+    _TS_SUFFIX_TO_JQ = {"SH": "XSHG", "SZ": "XSHE", "BJ": "XBEI", "BSE": "XBEI"}
+    _JQ_SUFFIX_TO_TS = {"XSHG": "SH", "XSHE": "SZ", "XBEI": "BJ", "BJ": "BJ", "BSE": "BJ"}
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
@@ -41,8 +48,37 @@ class TushareProvider(DataProvider):
         self._mem_cache_enabled = bool(mem_cfg)
         self._mem: Dict[str, Any] = {}
         self._tick_src = self.config.get("tick_src") or os.getenv("TUSHARE_TICK_SRC", "tt")
+        self._ch: Optional[TushareClickHouseClient] = build_clickhouse_client(self.config)
+        # types=stock 默认不含北交所（与聚宽 get_all_securities 对齐）；设 TUSHARE_INCLUDE_BSE=1 可保留
+        include_bse = self.config.get("include_bse")
+        if include_bse is None:
+            include_bse = os.getenv("TUSHARE_INCLUDE_BSE", "0") in ("1", "true", "True")
+        self._include_bse = bool(include_bse)
+
+    def _ch_available(self) -> bool:
+        return self._ch is not None and self._ch.is_available()
 
     # ------------------------ 公共工具 ------------------------
+    @classmethod
+    def _map_bse_numeric(cls, code: str) -> str:
+        """北交所老代码 43/83/87/821 → 920 新码（仅数字段）。"""
+        c = str(code or "").split(".", 1)[0].strip()
+        if not c.isdigit():
+            return c
+        if c.startswith("821") and len(c) >= 6:
+            return "920" + c[3:]
+        if c.startswith(("43", "83", "87")) and len(c) >= 6:
+            return "92" + c[2:]
+        return c
+
+    @classmethod
+    def _is_bse_ts_code(cls, ts_code: str) -> bool:
+        s = str(ts_code or "").upper()
+        if s.endswith((".BJ", ".BSE", ".XBEI")):
+            return True
+        num = s.split(".", 1)[0]
+        return num.startswith(("43", "82", "83", "87", "92")) and len(num) == 6
+
     @classmethod
     def _to_ts_code(cls, security: str) -> str:
         if not security or not isinstance(security, str) or "." not in security:
@@ -50,7 +86,7 @@ class TushareProvider(DataProvider):
         code, suffix = security.split(".", 1)
         mapped = cls._JQ_SUFFIX_TO_TS.get(suffix.upper())
         if mapped:
-            return f"{code}.{mapped}"
+            return f"{cls._map_bse_numeric(code)}.{mapped}"
         return security
 
     @classmethod
@@ -60,7 +96,7 @@ class TushareProvider(DataProvider):
         code, suffix = security.split(".", 1)
         mapped = cls._TS_SUFFIX_TO_JQ.get(suffix.upper())
         if mapped:
-            return f"{code}.{mapped}"
+            return f"{cls._map_bse_numeric(code)}.{mapped}"
         return security
 
     @staticmethod
@@ -331,15 +367,52 @@ class TushareProvider(DataProvider):
         freq: str,
         fq: Optional[str],
         pre_factor_ref_date: Optional[Union[str, datetime]],
+        prefer_native_qfq: bool = True,
     ) -> Tuple[pd.DataFrame, bool]:
         """
-        拉取未复权/原始 OHLCV。
-        返回 (df, already_qfq)。
-        日线股票前复权：优先 daily（代理上显著快于 pro_bar adj=qfq），复权交给本地 adj_factor。
+        拉取 OHLCV。返回 (df, already_qfq)。
+
+        日线优先走 ClickHouse 热链路（未复权），上层再本地复权。
+        无本地库时：前复权可走单次 pro_bar(adj='qfq')；失败则 daily + adj_factor。
         """
+        # ClickHouse 热路：日线 OHLCV 优先本地库，避免远程代理 RTT
+        if freq == "D" and self._ch_available():
+            assert self._ch is not None
+            try:
+                ch_df = self._ch.fetch_ohlcv(ts_code, asset, start_str, end_str)
+                if ch_df is not None and not ch_df.empty:
+                    return ch_df, False
+            except Exception:
+                pass
+
         ts = self._ensure_ts_module()
         pro = self._ensure_client()
-        _ = fq, pre_factor_ref_date
+
+        use_native_qfq = (
+            prefer_native_qfq
+            and freq == "D"
+            and asset == "E"
+            and fq == "pre"
+            and pre_factor_ref_date is None
+            and not self._ch_available()  # 有本地库时不做远程 qfq
+        )
+        if use_native_qfq:
+            try:
+                df = ts.pro_bar(
+                    ts_code=ts_code,
+                    start_date=start_str,
+                    end_date=end_str,
+                    freq=freq,
+                    adj="qfq",
+                    asset=asset,
+                    api=pro,
+                )
+                if df is not None and not df.empty:
+                    return df, True
+            except Exception:
+                pass
+            # 交给上层走 daily+adj_factor，避免此处再打一次 daily
+            return pd.DataFrame(), False
 
         if freq == "D" and asset == "E":
             df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
@@ -396,10 +469,64 @@ class TushareProvider(DataProvider):
         if hit:
             return cached.copy() if isinstance(cached, pd.DataFrame) else cached
 
-        need_adj = asset == "E" and fq in ("pre", "post")
-        # 日线前复权：daily 与 adj_factor 并行，避免串行双 RTT
+        # 日线前复权：有 ClickHouse 时直接 daily+adj（本地）；否则可先试远程 pro_bar(qfq)。
+        prefer_qfq = (
+            asset == "E"
+            and freq == "D"
+            and fq == "pre"
+            and pre_factor_ref_date is None
+            and not self._ch_available()
+        )
+
         factor_df = None
-        if need_adj and freq == "D":
+        already_qfq = False
+        df = pd.DataFrame()
+
+        # CH 热路：日线+复权因子一次 JOIN（省一次 HTTP RTT）
+        if (
+            freq == "D"
+            and asset == "E"
+            and fq in ("pre", "post")
+            and self._ch_available()
+        ):
+            assert self._ch is not None
+            try:
+                df, factor_df = self._ch.fetch_daily_and_adj(ts_code, start_str, end_str)
+                already_qfq = False
+            except Exception:
+                df, factor_df = pd.DataFrame(), None
+
+        if df is None or df.empty:
+            df, already_qfq = self._fetch_ohlcv_raw(
+                ts_code=ts_code,
+                asset=asset,
+                start_str=start_str,
+                end_str=end_str,
+                freq=freq,
+                fq=fq,
+                pre_factor_ref_date=pre_factor_ref_date,
+                prefer_native_qfq=prefer_qfq,
+            )
+
+        need_local_adj = (
+            asset == "E"
+            and fq in ("pre", "post")
+            and not already_qfq
+            and (df is not None and not df.empty)
+            and (factor_df is None or factor_df.empty)
+        )
+        # ClickHouse 命中未复权日线后，补 adj_factor（同样优先本地库）
+        if need_local_adj and self._ch_available():
+            try:
+                factor_df = self._fetch_adj_factor(
+                    security,
+                    pd.to_datetime(start_str or end_str),
+                    pd.to_datetime(end_str or start_str),
+                )
+            except Exception:
+                factor_df = None
+
+        if (df is None or df.empty) and prefer_qfq:
             try:
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     fut_px = pool.submit(
@@ -409,29 +536,23 @@ class TushareProvider(DataProvider):
                         start_str,
                         end_str,
                         freq,
-                        fq,
-                        pre_factor_ref_date,
+                        "none",
+                        None,
+                        False,
                     )
-                    # adj 窗口先按请求区间取；空数据时后面再兜底
-                    start_for_adj = start_str or end_str
-                    end_for_adj = end_str or start_str
                     fut_adj = pool.submit(
                         self._fetch_adj_factor,
                         security,
-                        pd.to_datetime(start_for_adj),
-                        pd.to_datetime(end_for_adj),
+                        pd.to_datetime(start_str or end_str),
+                        pd.to_datetime(end_str or start_str),
                     )
                     df, already_qfq = fut_px.result()
                     factor_df = fut_adj.result()
             except Exception:
                 df, already_qfq = self._fetch_ohlcv_raw(
-                    ts_code, asset, start_str, end_str, freq, fq, pre_factor_ref_date
+                    ts_code, asset, start_str, end_str, freq, "none", None, False
                 )
                 factor_df = None
-        else:
-            df, already_qfq = self._fetch_ohlcv_raw(
-                ts_code, asset, start_str, end_str, freq, fq, pre_factor_ref_date
-            )
 
         if df is None or df.empty:
             return self._memo_set(mem_key, pd.DataFrame())
@@ -462,17 +583,26 @@ class TushareProvider(DataProvider):
         if skip_paused and "is_paused" in df.columns:
             df = df[df["is_paused"] == 0]
 
-        if need_adj and not already_qfq:
+        if asset == "E" and fq in ("pre", "post") and not already_qfq:
+            # 前复权默认锚到最新交易日（与聚宽一致），而非查询区间末日
+            resolved_ref = pre_factor_ref_date
+            if resolved_ref is None and fq == "pre":
+                latest = self._latest_trade_day()
+                if latest is not None:
+                    resolved_ref = latest
             if factor_df is not None and not factor_df.empty and "adj_factor" in factor_df.columns:
+                factor_df = self._ensure_adj_factor_covers_ref(
+                    security, factor_df, df.index.min(), resolved_ref
+                )
                 df = self._apply_adjustment_with_factor(
-                    df, factor_df, fq=fq, pre_factor_ref_date=pre_factor_ref_date
+                    df, factor_df, fq=fq, pre_factor_ref_date=resolved_ref
                 )
             else:
                 df = self._apply_adjustment(
                     security=security,
                     df=df,
                     fq=fq,
-                    pre_factor_ref_date=pre_factor_ref_date,
+                    pre_factor_ref_date=resolved_ref,
                 )
 
         if count:
@@ -495,13 +625,15 @@ class TushareProvider(DataProvider):
         end_dt = df.index.max()
         factor_df = factor_df.copy()
         factor_df.index = pd.to_datetime(factor_df["trade_date"]).dt.normalize()
+        if not factor_df.index.is_unique:
+            factor_df = factor_df[~factor_df.index.duplicated(keep="last")]
         merged = df.copy()
         merged["_factor_date"] = pd.to_datetime(merged.index).normalize()
         merged = merged.join(factor_df["adj_factor"], on="_factor_date", how="left")
         merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
         ref_date = pre_factor_ref_date
         if ref_date is None and fq == "pre":
-            # 用区间末日作基准，避免再打 get_trade_days
+            # 与聚宽对齐：优先最新交易日；调用方通常已解析，此处兜底用区间末日
             ref_date = end_dt
         if ref_date is None:
             ref_date = end_dt if fq == "pre" else start_dt
@@ -511,15 +643,70 @@ class TushareProvider(DataProvider):
             ref_dt = pd.to_datetime(end_dt if fq == "pre" else start_dt).normalize()
         if ref_dt in factor_df.index:
             ref_factor = factor_df.loc[ref_dt, "adj_factor"]
+            if isinstance(ref_factor, pd.Series):
+                ref_factor = ref_factor.iloc[-1]
         else:
-            ref_factor = merged["adj_factor"].iloc[-1] if fq == "pre" else merged["adj_factor"].iloc[0]
+            # 参考日无因子时：前复权取不超过参考日的最近因子，否则退回序列端点
+            prior = factor_df.index[factor_df.index <= ref_dt]
+            if len(prior) > 0 and fq == "pre":
+                ref_factor = factor_df.loc[prior.max(), "adj_factor"]
+            else:
+                ref_factor = merged["adj_factor"].iloc[-1] if fq == "pre" else merged["adj_factor"].iloc[0]
+            if isinstance(ref_factor, pd.Series):
+                ref_factor = ref_factor.iloc[-1]
         if ref_factor is None or (isinstance(ref_factor, float) and pd.isna(ref_factor)):
+            return df
+        try:
+            ref_factor = float(ref_factor)
+        except Exception:
+            return df
+        if ref_factor == 0.0:
             return df
         ratio = (merged["adj_factor"] / ref_factor) if fq == "pre" else (ref_factor / merged["adj_factor"])
         for col in ["open", "high", "low", "close"]:
             if col in merged.columns:
                 merged[col] = merged[col] * ratio
+        # 成交量按价格比例反权重（与聚宽 fq=pre 一致）；成交额保持不变
+        if "volume" in merged.columns:
+            safe = ratio.replace(0, pd.NA)
+            merged["volume"] = merged["volume"] / safe
+            merged["volume"] = merged["volume"].fillna(df["volume"] if "volume" in df.columns else 0.0)
         merged.drop(columns=["adj_factor", "_factor_date"], inplace=True, errors="ignore")
+        return merged
+
+    def _ensure_adj_factor_covers_ref(
+        self,
+        security: str,
+        factor_df: pd.DataFrame,
+        start_dt: Any,
+        ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
+        """若前复权参考日晚于已有因子区间，补拉到参考日。"""
+        if factor_df is None or factor_df.empty or ref_date is None:
+            return factor_df
+        try:
+            ref_dt = pd.to_datetime(ref_date).normalize()
+        except Exception:
+            return factor_df
+        work = factor_df.copy()
+        if "trade_date" in work.columns:
+            dates = pd.to_datetime(work["trade_date"], errors="coerce")
+        else:
+            dates = pd.to_datetime(work.index, errors="coerce")
+        if dates.isna().all():
+            return factor_df
+        max_dt = dates.max()
+        if pd.isna(max_dt) or max_dt.normalize() >= ref_dt:
+            return factor_df
+        try:
+            extra = self._fetch_adj_factor(security, pd.to_datetime(start_dt), ref_dt)
+        except Exception:
+            return factor_df
+        if extra is None or extra.empty:
+            return factor_df
+        merged = pd.concat([work, extra], ignore_index=True)
+        if "trade_date" in merged.columns:
+            merged = merged.drop_duplicates(subset=["trade_date"], keep="last")
         return merged
 
     def _apply_adjustment(
@@ -531,16 +718,27 @@ class TushareProvider(DataProvider):
     ) -> pd.DataFrame:
         start_dt = df.index.min()
         end_dt = df.index.max()
-        factor_df = self._fetch_adj_factor(security, start_dt, end_dt)
+        ref_date = pre_factor_ref_date
+        if ref_date is None and fq == "pre":
+            latest = self._latest_trade_day()
+            if latest is not None:
+                ref_date = latest
+        factor_end = end_dt
+        if ref_date is not None:
+            try:
+                factor_end = max(pd.to_datetime(end_dt), pd.to_datetime(ref_date))
+            except Exception:
+                factor_end = end_dt
+        factor_df = self._fetch_adj_factor(security, start_dt, factor_end)
         if factor_df.empty or "adj_factor" not in factor_df.columns:
             fallback = self._build_adjusted_from_events(
                 security=security,
                 raw_df=df,
                 fq=fq,
-                pre_factor_ref_date=pre_factor_ref_date,
+                pre_factor_ref_date=ref_date,
             )
             return fallback if not fallback.empty else df
-        return self._apply_adjustment_with_factor(df, factor_df, fq=fq, pre_factor_ref_date=pre_factor_ref_date)
+        return self._apply_adjustment_with_factor(df, factor_df, fq=fq, pre_factor_ref_date=ref_date)
 
     def _build_adjusted_from_events(
         self,
@@ -648,6 +846,10 @@ class TushareProvider(DataProvider):
 
         for col in price_cols:
             adj_df[col] = adj_df[col].astype(float) * factors
+        if "volume" in adj_df.columns:
+            safe = factors.replace(0, pd.NA)
+            adj_df["volume"] = adj_df["volume"].astype(float) / safe
+            adj_df["volume"] = adj_df["volume"].fillna(raw_df["volume"] if "volume" in raw_df.columns else 0.0)
 
         return self._align_reference(raw_df, adj_df, pre_factor_ref_date)
 
@@ -676,6 +878,8 @@ class TushareProvider(DataProvider):
         for col in ["open", "high", "low", "close"]:
             if col in adj_df.columns:
                 adj_df[col] = adj_df[col] * scale
+        if "volume" in adj_df.columns and scale != 0:
+            adj_df["volume"] = adj_df["volume"] / scale
         return adj_df
 
     def _latest_trade_day(self) -> Optional[datetime]:
@@ -695,8 +899,13 @@ class TushareProvider(DataProvider):
         }
 
         def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
-            pro = self._ensure_client()
             ts_code = self._to_ts_code(kw["security"])
+            if self._ch_available():
+                assert self._ch is not None
+                ch_df = self._ch.fetch_adj_factor(ts_code, kw["start_date"], kw["end_date"])
+                if ch_df is not None and not ch_df.empty:
+                    return ch_df
+            pro = self._ensure_client()
             return pro.adj_factor(
                 ts_code=ts_code,
                 start_date=kw["start_date"],
@@ -719,7 +928,6 @@ class TushareProvider(DataProvider):
         }
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
-            pro = self._ensure_client()
             start = self._format_date(kw.get("start_date"))
             end = self._format_date(kw.get("end_date"))
             count = kw.get("count")
@@ -727,6 +935,29 @@ class TushareProvider(DataProvider):
             if count and end and not start and count != -1:
                 end_dt = pd.to_datetime(end)
                 start = (end_dt - pd.Timedelta(days=int(count) * 3 + 20)).strftime("%Y%m%d")
+
+            if self._ch_available():
+                assert self._ch is not None
+                # 开市日窄表 + 行结果，避免 DF/is_open 过滤
+                open_days = self._ch.fetch_open_cal_ymds(start, end, exchange="SSE")
+                if open_days:
+                    if count and count != -1:
+                        open_days = open_days[-int(count) :]
+                    return open_days
+                ch_df = self._ch.fetch_trade_cal(start, end, exchange="SSE")
+                if ch_df is not None and not ch_df.empty and "is_open" in ch_df.columns:
+                    open_days = (
+                        ch_df[ch_df["is_open"].astype(int) == 1]["cal_date"]
+                        .astype(str)
+                        .sort_values()
+                        .tolist()
+                    )
+                    if count and count != -1:
+                        open_days = open_days[-int(count) :]
+                    if open_days:
+                        return open_days
+
+            pro = self._ensure_client()
             df = pro.trade_cal(
                 exchange="SSE",
                 start_date=start,
@@ -736,39 +967,99 @@ class TushareProvider(DataProvider):
             open_days = df[df["is_open"] == 1]["cal_date"].sort_values().tolist()
             if count and count != -1:
                 open_days = open_days[-int(count) :]
-            return open_days
+            return [str(x) for x in open_days]
 
         memo_key = f"trade_days:{kwargs.get('start_date')}:{kwargs.get('end_date')}:{kwargs.get('count')}"
         hit, cached = self._memo_get(memo_key)
         if hit:
-            date_strs = cached
-        else:
-            date_strs = self._cache.cached_call("get_trade_days", kwargs, _fetch, result_type="list_str")
-            self._memo_set(memo_key, date_strs)
-        return [pd.to_datetime(d).to_pydatetime() for d in date_strs]
+            return list(cached)
+        date_strs = self._cache.cached_call("get_trade_days", kwargs, _fetch, result_type="list_str")
+        # strptime 比逐个 pd.to_datetime 更轻
+        out = [datetime.strptime(str(d)[:8], "%Y%m%d") for d in date_strs]
+        return self._memo_set(memo_key, out)
 
     def get_all_securities(
         self,
         types: Union[str, List[str]] = "stock",
         date: Optional[Union[str, datetime]] = None,
     ) -> pd.DataFrame:
+        """
+        证券列表。
+
+        - types=stock 且传入 date：拉取 list_status=L+D（必要时补 P），再按 list_date/delist_date 过滤。
+        - types=stock 且 date 为空：仅 L（当前在市）。
+        - 默认剔除北交所（与聚宽对齐）；``include_bse=True`` / ``TUSHARE_INCLUDE_BSE=1`` 可保留。
+        """
         if isinstance(types, str):
             types = [types]
 
-        kwargs = {"types": tuple(sorted(types)), "date": date}
+        kwargs = {
+            "types": tuple(sorted(types)),
+            "date": date,
+            "include_bse": self._include_bse,
+        }
+        memo_key = (
+            f"all_securities:{kwargs['types']}:{self._format_date(date) or ''}:"
+            f"bse={int(self._include_bse)}"
+        )
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached.copy() if isinstance(cached, pd.DataFrame) else cached
 
-        def _fetch(kw: Dict[str, Any]) -> Dict[str, Any]:
+        def _fetch_stock_basic_frames(need_history: bool) -> pd.DataFrame:
+            """need_history=True 时取 L+D(+P)，否则仅 L。"""
+            statuses = ["L", "D", "P"] if need_history else ["L"]
+            frames: List[pd.DataFrame] = []
+            keep_cols = ("ts_code", "name", "list_date", "delist_date", "market", "list_status")
+
+            if self._ch_available():
+                assert self._ch is not None
+                if need_history:
+                    ch_df = self._ch.fetch_stock_basic(list_status=None)
+                else:
+                    ch_df = self._ch.fetch_stock_basic(list_status="L")
+                if ch_df is not None and not ch_df.empty:
+                    keep = [c for c in keep_cols if c in ch_df.columns]
+                    return ch_df[keep].copy()
+
             pro = self._ensure_client()
+            for status in statuses:
+                try:
+                    part = pro.stock_basic(
+                        exchange="",
+                        list_status=status,
+                        fields="ts_code,name,list_date,delist_date,market,list_status",
+                    )
+                except Exception:
+                    if status == "P":
+                        continue
+                    raise
+                if part is None or part.empty:
+                    continue
+                frames.append(part)
+            if not frames:
+                return pd.DataFrame()
+            out = pd.concat(frames, ignore_index=True)
+            if "ts_code" in out.columns:
+                out = out.drop_duplicates(subset=["ts_code"], keep="first")
+            return out
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
             rows = []
+            target_date = kw.get("date")
+            need_history = target_date is not None
+            include_bse = bool(kw.get("include_bse"))
+
             for t in kw["types"]:
                 if t == "stock":
-                    df = pro.stock_basic(
-                        exchange="",
-                        list_status="L",
-                        fields="ts_code,name,list_date,delist_date",
-                    )
+                    df = _fetch_stock_basic_frames(need_history=need_history)
+                    if df is None or df.empty:
+                        continue
+                    if not include_bse and "ts_code" in df.columns:
+                        df = df[~df["ts_code"].map(self._is_bse_ts_code)].copy()
                     df["type"] = "stock"
                 elif t in ("fund", "etf", "lof"):
+                    pro = self._ensure_client()
                     df = pro.fund_basic(
                         status="L",
                         market="E",
@@ -780,6 +1071,7 @@ class TushareProvider(DataProvider):
                         df = df[df["ts_code"].str.contains("LOF")]
                     df["type"] = t
                 elif t == "index":
+                    pro = self._ensure_client()
                     df = pro.index_basic(market="SSE")
                     df = pd.concat([df, pro.index_basic(market="SZSE")])
                     df.rename(columns={"fullname": "name"}, inplace=True)
@@ -800,11 +1092,11 @@ class TushareProvider(DataProvider):
                 rows.append(df[["ts_code", "display_name", "name", "start_date", "end_date", "type"]])
 
             if not rows:
-                return {}
+                return pd.DataFrame(columns=["display_name", "name", "start_date", "end_date", "type"])
             merged = pd.concat(rows, ignore_index=True).drop_duplicates("ts_code")
-            if kw.get("date") is not None:
+            if target_date is not None:
                 try:
-                    target_dt = pd.to_datetime(kw["date"])
+                    target_dt = pd.to_datetime(target_date)
                     start_dt = pd.to_datetime(merged["start_date"], errors="coerce").fillna(pd.Timestamp.min)
                     end_dt = pd.to_datetime(merged["end_date"], errors="coerce").fillna(pd.Timestamp.max)
                     merged = merged[(start_dt <= target_dt) & (end_dt >= target_dt)]
@@ -812,15 +1104,18 @@ class TushareProvider(DataProvider):
                     pass
             merged.set_index("ts_code", inplace=True)
             merged.index = [self._to_jq_code(code) for code in merged.index]
-            return merged.to_dict(orient="index")
+            return merged
 
-        data = self._cache.cached_call("get_all_securities", kwargs, _fetch, result_type="list_dict")
-        if not data:
-            return pd.DataFrame(columns=["display_name", "name", "start_date", "end_date", "type"])
-        df = pd.DataFrame.from_dict(data, orient="index")
-        df["start_date"] = pd.to_datetime(df["start_date"])
-        df["end_date"] = pd.to_datetime(df["end_date"])
-        return df
+        # 与 jqdata 对齐：磁盘存 parquet DataFrame，进程内 mem 复用
+        df = self._cache.cached_call("get_all_securities", kwargs, _fetch, result_type="df")
+        if df is None or df.empty:
+            empty = pd.DataFrame(columns=["display_name", "name", "start_date", "end_date", "type"])
+            return self._memo_set(memo_key, empty)
+        if "start_date" in df.columns:
+            df["start_date"] = pd.to_datetime(df["start_date"])
+        if "end_date" in df.columns:
+            df["end_date"] = pd.to_datetime(df["end_date"])
+        return self._memo_set(memo_key, df)
 
     def _fetch_index_weight_df(self, index_code: str, date: Optional[Union[str, datetime]] = None) -> pd.DataFrame:
         """
@@ -831,9 +1126,25 @@ class TushareProvider(DataProvider):
         memo_key = f"idx_weight:{index_code}:{target_date}"
 
         def _fetch() -> pd.DataFrame:
+            if self._ch_available():
+                assert self._ch is not None
+                ch_df = self._ch.fetch_index_weight_asof(index_code, target_date)
+                if ch_df is not None and not ch_df.empty:
+                    return ch_df
+                # 回退旧区间扫描
+                end_dt = pd.to_datetime(target_date)
+                start_dt = end_dt - pd.Timedelta(days=120)
+                ch_df = self._ch.fetch_index_weight(
+                    index_code,
+                    start_dt.strftime("%Y%m%d"),
+                    target_date,
+                )
+                if ch_df is not None and not ch_df.empty:
+                    latest = ch_df["trade_date"].max()
+                    return ch_df[ch_df["trade_date"] == latest].copy()
+
             pro = self._ensure_client()
             end_dt = pd.to_datetime(target_date)
-            # 覆盖至少一个调仓月；绝大多数一次命中
             start_dt = end_dt - pd.Timedelta(days=40)
             df = pro.index_weight(
                 index_code=index_code,
@@ -855,26 +1166,45 @@ class TushareProvider(DataProvider):
         return self._memo_call(memo_key, _fetch)
 
     def _stock_basic_row(self, ts_code: str) -> Optional[Dict[str, Any]]:
-        """一次性缓存全市场 stock_basic，点查走本地 dict（显著加速 security_info/industry）。"""
+        """优先全表 map；其次单行 mem；再 CH 点查；最后拉全表建 map。"""
+        hit, mapping = self._memo_get("stock_basic_map_L")
+        if hit and isinstance(mapping, dict):
+            return mapping.get(ts_code)
+
+        row_key = f"stock_basic_row:{ts_code}"
+        hit, cached_row = self._memo_get(row_key)
+        if hit:
+            return cached_row
+
+        if self._ch_available():
+            assert self._ch is not None
+            row = self._ch.fetch_stock_basic_row(ts_code)
+            if row:
+                return self._memo_set(row_key, row)
 
         def _load() -> Dict[str, Dict[str, Any]]:
-            pro = self._ensure_client()
-            df = pro.stock_basic(
-                exchange="",
-                list_status="L",
-                fields="ts_code,name,list_date,delist_date,industry,market",
-            )
+            df = None
+            if self._ch_available():
+                assert self._ch is not None
+                df = self._ch.fetch_stock_basic(list_status="L")
+            if df is None or df.empty:
+                pro = self._ensure_client()
+                df = pro.stock_basic(
+                    exchange="",
+                    list_status="L",
+                    fields="ts_code,name,list_date,delist_date,industry,market",
+                )
             if df is None or df.empty:
                 return {}
             out: Dict[str, Dict[str, Any]] = {}
-            for row in df.itertuples(index=False):
-                out[str(row.ts_code)] = {
-                    "ts_code": str(row.ts_code),
-                    "name": getattr(row, "name", None),
-                    "list_date": getattr(row, "list_date", None),
-                    "delist_date": getattr(row, "delist_date", None),
-                    "industry": getattr(row, "industry", None),
-                    "market": getattr(row, "market", None),
+            for r in df.itertuples(index=False):
+                out[str(r.ts_code)] = {
+                    "ts_code": str(r.ts_code),
+                    "name": getattr(r, "name", None),
+                    "list_date": getattr(r, "list_date", None),
+                    "delist_date": getattr(r, "delist_date", None),
+                    "industry": getattr(r, "industry", None),
+                    "market": getattr(r, "market", None),
                 }
             return out
 
@@ -996,18 +1326,61 @@ class TushareProvider(DataProvider):
         return self._memo_call(memo_key, _fetch)
 
     def get_trade_day(self, security: Union[str, List[str]], query_dt: Union[str, datetime]) -> Any:
-        try:
-            trade_days = self.get_trade_days(end_date=query_dt, count=1)
-        except Exception:
-            trade_days = []
-        if not trade_days:
+        """
+        映射查询日到最近交易日。
+        优先：进程 mem → 磁盘点缓存 → CH LIMIT 1 → 窄窗口 trade_cal。
+        避免走 get_trade_days 全量区间 + datetime 转换。
+        """
+        q = self._format_date(query_dt) or datetime.today().strftime("%Y%m%d")
+        memo_key = f"trade_day:{q}"
+        hit, last_day = self._memo_get(memo_key)
+        if not hit:
+
+            def _fetch(_kw: Dict[str, Any]) -> List[str]:
+                if self._ch_available():
+                    assert self._ch is not None
+                    ch_day = self._ch.fetch_prev_open_day(q, exchange="SSE")
+                    if ch_day:
+                        return [str(ch_day)]
+                end = q
+                start = (pd.to_datetime(q) - pd.Timedelta(days=20)).strftime("%Y%m%d")
+                try:
+                    pro = self._ensure_client()
+                    df = pro.trade_cal(
+                        exchange="SSE",
+                        start_date=start,
+                        end_date=end,
+                        fields="cal_date,is_open",
+                    )
+                    if df is not None and not df.empty:
+                        open_days = df[df["is_open"] == 1]["cal_date"].astype(str).sort_values()
+                        if len(open_days):
+                            return [str(open_days.iloc[-1])]
+                except Exception:
+                    pass
+                return []
+
+            ymd_list = self._cache.cached_call(
+                "get_trade_day",
+                {"query_dt": q},
+                _fetch,
+                result_type="list_str",
+            )
+            ymd = ymd_list[0] if ymd_list else None
+            if not ymd:
+                try:
+                    days = self.get_trade_days(end_date=query_dt, count=1)
+                    ymd = self._format_date(days[-1]) if days else None
+                except Exception:
+                    ymd = None
             last_day = None
-        else:
-            last_value = trade_days[-1]
-            try:
-                last_day = pd.to_datetime(last_value).date()
-            except Exception:
-                last_day = last_value
+            if ymd:
+                try:
+                    last_day = pd.to_datetime(ymd).date()
+                except Exception:
+                    last_day = None
+            self._memo_set(memo_key, last_day)
+
         if isinstance(security, (list, tuple, set)):
             securities = list(security)
         else:
@@ -1372,40 +1745,49 @@ class TushareProvider(DataProvider):
 
         raise NotImplementedError(f"Tushare get_extras 暂不支持 info={info}")
 
-    def _daily_basic_valuation(self, trade_date: str) -> pd.DataFrame:
-        memo_key = f"daily_basic:{trade_date}"
+    def _daily_basic_valuation_from_raw(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(
+                columns=["code", "market_cap", "circulating_market_cap", "pe_ratio", "pb_ratio", "day"]
+            )
+        codes = df["ts_code"].astype(str).str.replace(".SH", ".XSHG", regex=False)
+        codes = codes.str.replace(".SZ", ".XSHE", regex=False)
+        return pd.DataFrame(
+            {
+                "code": codes,
+                "market_cap": pd.to_numeric(df["total_mv"], errors="coerce") / 10000.0,
+                "circulating_market_cap": pd.to_numeric(df["circ_mv"], errors="coerce") / 10000.0,
+                "pe_ratio": pd.to_numeric(df.get("pe"), errors="coerce"),
+                "pb_ratio": pd.to_numeric(df.get("pb"), errors="coerce"),
+                "day": pd.to_datetime(df["trade_date"], errors="coerce"),
+            }
+        )
+
+    def _daily_basic_valuation(self, trade_date: str, *, asof: bool = True) -> pd.DataFrame:
+        memo_key = f"daily_basic:{trade_date}:asof={int(bool(asof))}"
         hit, cached = self._memo_get(memo_key)
         if hit:
             return cached
 
         def _fetch(_kw: Dict[str, Any]) -> pd.DataFrame:
-            pro = self._ensure_client()
-            # 精简字段，降低代理传输
-            df = pro.daily_basic(
-                trade_date=trade_date,
-                fields="ts_code,trade_date,total_mv,circ_mv,pe,pb",
-            )
+            df = None
+            if self._ch_available():
+                assert self._ch is not None
+                # 单日快照允许 asof；连续序列应 asof=False，缺日走远程保真
+                df = self._ch.fetch_daily_basic(trade_date, asof=asof)
             if df is None or df.empty:
-                return pd.DataFrame(
-                    columns=["code", "market_cap", "circulating_market_cap", "pe_ratio", "pb_ratio", "day"]
+                pro = self._ensure_client()
+                df = pro.daily_basic(
+                    trade_date=trade_date,
+                    fields="ts_code,trade_date,total_mv,circ_mv,pe,pb",
                 )
-            # 向量化后缀替换，避免逐行 Python map
-            codes = df["ts_code"].astype(str).str.replace(".SH", ".XSHG", regex=False)
-            codes = codes.str.replace(".SZ", ".XSHE", regex=False)
-            return pd.DataFrame(
-                {
-                    "code": codes,
-                    "market_cap": pd.to_numeric(df["total_mv"], errors="coerce") / 10000.0,
-                    "circulating_market_cap": pd.to_numeric(df["circ_mv"], errors="coerce") / 10000.0,
-                    "pe_ratio": pd.to_numeric(df.get("pe"), errors="coerce"),
-                    "pb_ratio": pd.to_numeric(df.get("pb"), errors="coerce"),
-                    "day": pd.to_datetime(df["trade_date"], errors="coerce"),
-                }
+            return self._daily_basic_valuation_from_raw(
+                df if df is not None else pd.DataFrame()
             )
 
         out = self._cache.cached_call(
             "daily_basic_valuation",
-            {"trade_date": trade_date},
+            {"trade_date": trade_date, "asof": int(bool(asof))},
             _fetch,
             result_type="df",
         )
@@ -1442,13 +1824,31 @@ class TushareProvider(DataProvider):
         if not trade_dates:
             return pd.DataFrame()
 
-        # 先吃 mem/disk 命中，仅对未命中日期打网；冷启动并行
         frames: List[pd.DataFrame] = []
         missing: List[str] = []
+
+        # CH：一次拉区间，避免逐日空查 RTT
+        ch_by_day: Dict[str, pd.DataFrame] = {}
+        if self._ch_available():
+            assert self._ch is not None
+            try:
+                raw = self._ch.fetch_daily_basic_range(min(trade_dates), max(trade_dates))
+                if raw is not None and not raw.empty and "trade_date" in raw.columns:
+                    raw = raw.copy()
+                    raw["_d"] = raw["trade_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+                    for d, part in raw.groupby("_d"):
+                        valued = self._daily_basic_valuation_from_raw(part.drop(columns=["_d"]))
+                        ch_by_day[str(d)] = valued
+                        self._memo_set(f"daily_basic:{d}:asof=0", valued)
+            except Exception:
+                ch_by_day = {}
+
         for d in trade_dates:
-            hit, cached = self._memo_get(f"daily_basic:{d}")
+            hit, cached = self._memo_get(f"daily_basic:{d}:asof=0")
             if hit and cached is not None and not getattr(cached, "empty", False):
                 frames.append(cached)
+            elif d in ch_by_day and not ch_by_day[d].empty:
+                frames.append(ch_by_day[d])
             else:
                 missing.append(d)
 
@@ -1456,14 +1856,17 @@ class TushareProvider(DataProvider):
             max_workers = min(4, len(missing))
             try:
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    futs = {pool.submit(self._daily_basic_valuation, d): d for d in missing}
+                    futs = {
+                        pool.submit(self._daily_basic_valuation, d, asof=False): d
+                        for d in missing
+                    }
                     for fut in as_completed(futs):
                         part = fut.result()
                         if part is not None and not part.empty:
                             frames.append(part)
             except Exception:
                 for d in missing:
-                    part = self._daily_basic_valuation(d)
+                    part = self._daily_basic_valuation(d, asof=False)
                     if part is not None and not part.empty:
                         frames.append(part)
 
@@ -1498,53 +1901,102 @@ class TushareProvider(DataProvider):
         df = self._cache.cached_call("sw_member_all", {}, _fetch, result_type="df")
         return self._memo_set(memo_key, df)
 
+    def _sw_industry_index(self) -> Dict[str, List[str]]:
+        """行业码 → 成分股（jq 后缀）倒排索引；构建一次后 mem 复用。"""
+        memo_key = "sw_industry_index"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
+
+        df = self._sw_member_table()
+        index: Dict[str, List[str]] = {}
+        if df is None or df.empty:
+            return self._memo_set(memo_key, index)
+
+        work = df
+        if "is_new" in work.columns:
+            cur = work[work["is_new"].astype(str).str.upper() == "Y"]
+            if not cur.empty:
+                work = cur
+        member_col = "ts_code" if "ts_code" in work.columns else ("con_code" if "con_code" in work.columns else None)
+        if not member_col:
+            return self._memo_set(memo_key, index)
+
+        members = (
+            work[member_col]
+            .dropna()
+            .astype(str)
+            .str.replace(".SH", ".XSHG", regex=False)
+            .str.replace(".SZ", ".XSHE", regex=False)
+        )
+        work = work.loc[members.index]
+        members = members.tolist()
+        for col in ("l1_code", "l2_code", "l3_code", "index_code"):
+            if col not in work.columns:
+                continue
+            keys = work[col].astype(str).tolist()
+            for key, mem in zip(keys, members):
+                if not key or key.lower() in {"nan", "none"}:
+                    continue
+                bucket = index.setdefault(key, [])
+                bucket.append(mem)
+        # 去重保序
+        for key, vals in list(index.items()):
+            seen = set()
+            uniq: List[str] = []
+            for v in vals:
+                if v in seen:
+                    continue
+                seen.add(v)
+                uniq.append(v)
+            index[key] = uniq
+        return self._memo_set(memo_key, index)
+
     def get_industry_stocks(self, industry_code: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
-        """行业成分股：申万代码（如 801010.SI）本地过滤当前成分。"""
+        """行业成分股：申万代码本地倒排 + 按码磁盘缓存。"""
         _ = date
         code = str(industry_code or "").strip()
         if code.upper().startswith("HY"):
             def _sw_l1_first() -> str:
-                def _fetch_classify() -> str:
+                def _fetch_classify(_kw: Dict[str, Any]) -> List[str]:
                     try:
                         pro = self._ensure_client()
                         classify = pro.index_classify(level="L1", src="SW2021")
                         if classify is not None and not classify.empty:
-                            return str(classify.iloc[0].get("index_code") or "")
+                            val = str(classify.iloc[0].get("index_code") or "")
+                            return [val] if val else []
                     except Exception:
-                        return ""
-                    return ""
+                        return []
+                    return []
 
-                return self._memo_call("sw_l1_first", _fetch_classify)
+                hit, cached = self._memo_get("sw_l1_first")
+                if hit:
+                    return str(cached or "")
+                rows = self._cache.cached_call("sw_l1_first", {}, _fetch_classify, result_type="list_str")
+                val = rows[0] if rows else ""
+                self._memo_set("sw_l1_first", val)
+                return val
 
             code = _sw_l1_first()
         if not code:
             return []
 
         memo_key = f"industry_stocks:{code}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return list(cached)
 
-        def _fetch() -> List[str]:
-            df = self._sw_member_table()
-            if df is None or df.empty:
-                return []
-            mask = pd.Series(False, index=df.index)
-            for col in ("l1_code", "l2_code", "l3_code", "index_code"):
-                if col in df.columns:
-                    mask = mask | (df[col].astype(str) == code)
-            df = df.loc[mask]
-            if df.empty:
-                return []
-            if "is_new" in df.columns:
-                cur = df[df["is_new"].astype(str).str.upper() == "Y"]
-                if not cur.empty:
-                    df = cur
-            col = "ts_code" if "ts_code" in df.columns else ("con_code" if "con_code" in df.columns else None)
-            if not col:
-                return []
-            codes = df[col].dropna().astype(str)
-            codes = codes.str.replace(".SH", ".XSHG", regex=False).str.replace(".SZ", ".XSHE", regex=False)
-            return codes.tolist()
+        def _fetch(_kw: Dict[str, Any]) -> List[str]:
+            idx = self._sw_industry_index()
+            return list(idx.get(code, []))
 
-        return self._memo_call(memo_key, _fetch)
+        out = self._cache.cached_call(
+            "get_industry_stocks",
+            {"industry_code": code},
+            _fetch,
+            result_type="list_str",
+        )
+        return self._memo_set(memo_key, list(out or []))
 
     def get_industry(self, security: Union[str, List[str]], date: Optional[Union[str, datetime]] = None) -> Any:
         _ = date
@@ -1567,15 +2019,46 @@ class TushareProvider(DataProvider):
         msg = str(exc)
         return ("接口不存在" in msg) or ("请指定正确的接口名" in msg) or ("该接口" in msg and "不存在" in msg)
 
+    def _concept_flag_path(self) -> Optional[Path]:
+        if not getattr(self._cache, "enabled", False) or not self._cache.cache_dir:
+            return None
+        return Path(self._cache.cache_dir) / "concept_api_enabled.json"
+
     def _concept_api_enabled(self) -> bool:
         hit, val = self._memo_get("concept_api_enabled")
         if hit:
             return bool(val)
+        path = self._concept_flag_path()
+        if path is not None and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                enabled = bool(data.get("enabled", True))
+                self._memo_set("concept_api_enabled", enabled)
+                return enabled
+            except Exception:
+                pass
         # 未知时先当作可用，真正调用失败后再标记
         return True
 
     def _mark_concept_api(self, enabled: bool) -> None:
         self._memo_set("concept_api_enabled", bool(enabled))
+        path = self._concept_flag_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "enabled": bool(enabled),
+                        "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def _concept_catalog(self) -> pd.DataFrame:
         """概念列表（轻量），用于校验/回退 concept_code。"""
@@ -1613,8 +2096,13 @@ class TushareProvider(DataProvider):
         if not code:
             return []
         memo_key = f"concept_stocks:{code}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return list(cached)
 
-        def _fetch() -> List[str]:
+        def _fetch(_kw: Dict[str, Any]) -> List[str]:
+            if not self._concept_api_enabled():
+                return []
             pro = self._ensure_client()
             try:
                 df = pro.concept_detail(id=code)
@@ -1626,7 +2114,13 @@ class TushareProvider(DataProvider):
                 return []
             return [self._to_jq_code(c) for c in df["ts_code"].dropna().tolist()]
 
-        return self._memo_call(memo_key, _fetch)
+        out = self._cache.cached_call(
+            "get_concept_stocks",
+            {"concept_code": code},
+            _fetch,
+            result_type="list_str",
+        )
+        return self._memo_set(memo_key, list(out or []))
 
     def get_concept(self, security: Union[str, List[str]], date: Optional[Union[str, datetime]] = None) -> Any:
         _ = date
@@ -1636,12 +2130,18 @@ class TushareProvider(DataProvider):
             return empty
 
         result: Dict[str, Any] = {}
-        pro = self._ensure_client()
         for sec in securities:
             ts_code = self._to_ts_code(str(sec))
             memo_key = f"concept:{ts_code}"
+            hit, cached = self._memo_get(memo_key)
+            if hit:
+                result[str(sec)] = {"jq_concept": list(cached)}
+                continue
 
-            def _fetch(code: str = ts_code) -> List[Dict[str, Any]]:
+            def _fetch(_kw: Dict[str, Any], code: str = ts_code) -> List[Dict[str, Any]]:
+                if not self._concept_api_enabled():
+                    return []
+                pro = self._ensure_client()
                 try:
                     try:
                         df = pro.concept_detail(
@@ -1662,7 +2162,14 @@ class TushareProvider(DataProvider):
                 names = df[name_col].astype(str).tolist() if name_col else [None] * len(df)
                 return [{"concept_code": c, "concept_name": n} for c, n in zip(codes, names)]
 
-            concepts = self._memo_call(memo_key, _fetch)
+            concepts = self._cache.cached_call(
+                "get_concept",
+                {"ts_code": ts_code},
+                _fetch,
+                result_type="list_dict",
+            )
+            concepts = list(concepts or [])
+            self._memo_set(memo_key, concepts)
             result[str(sec)] = {"jq_concept": concepts}
         return result
 
@@ -1672,30 +2179,39 @@ class TushareProvider(DataProvider):
         if str(security).upper().endswith(".OF") and not ts_code.upper().endswith(".OF"):
             ts_code = f"{security.split('.')[0]}.OF"
         elif not ts_code.upper().endswith((".OF", ".SH", ".SZ")):
-            # 裸代码默认按场外基金试
             ts_code = f"{ts_code}.OF"
         memo_key = f"fund_info:{ts_code}"
+        hit, cached = self._memo_get(memo_key)
+        if hit:
+            return cached
 
-        def _fetch() -> Dict[str, Any]:
-            pro = self._ensure_client()
+        def _fetch(_kw: Dict[str, Any]) -> List[Dict[str, Any]]:
             df = None
-            # 场外优先 market='O'，避免无效代码空转
-            trials = []
-            if ts_code.upper().endswith(".OF"):
-                trials = [{"ts_code": ts_code, "market": "O"}, {"ts_code": ts_code}]
-            else:
-                trials = [{"ts_code": ts_code, "market": "E"}, {"ts_code": ts_code}]
-            try:
-                for kwargs in trials:
-                    df = pro.fund_basic(**kwargs)
-                    if df is not None and not df.empty:
-                        break
-            except Exception as exc:
-                raise RuntimeError(f"get_fund_info 失败: {exc}") from exc
+            if self._ch_available():
+                assert self._ch is not None
+                df = self._ch.fetch_fund_basic(ts_code)
             if df is None or df.empty:
-                return {}
+                pro = self._ensure_client()
+                fields = "ts_code,name,fund_type,found_date,list_date,delist_date,management,custodian"
+                if ts_code.upper().endswith(".OF"):
+                    trials = [{"ts_code": ts_code, "market": "O", "fields": fields}]
+                else:
+                    trials = [{"ts_code": ts_code, "market": "E", "fields": fields}]
+                try:
+                    for kwargs in trials:
+                        try:
+                            df = pro.fund_basic(**kwargs)
+                        except TypeError:
+                            kwargs.pop("fields", None)
+                            df = pro.fund_basic(**kwargs)
+                        if df is not None and not df.empty:
+                            break
+                except Exception as exc:
+                    raise RuntimeError(f"get_fund_info 失败: {exc}") from exc
+            if df is None or df.empty:
+                return []
             row = df.iloc[0].to_dict()
-            return {
+            info = {
                 "fund_name": row.get("name"),
                 "fund_type": row.get("fund_type"),
                 "start_date": row.get("found_date") or row.get("list_date"),
@@ -1704,8 +2220,16 @@ class TushareProvider(DataProvider):
                 "trustee": row.get("custodian"),
                 "raw": row,
             }
+            return [info]
 
-        return self._memo_call(memo_key, _fetch)
+        rows = self._cache.cached_call(
+            "get_fund_info",
+            {"ts_code": ts_code},
+            _fetch,
+            result_type="list_dict",
+        )
+        out = rows[0] if rows else {}
+        return self._memo_set(memo_key, out)
 
     def _margin_stocks(self, date: Optional[Union[str, datetime]] = None) -> List[str]:
         trade_date = self._format_date(date)
@@ -1728,9 +2252,9 @@ class TushareProvider(DataProvider):
                 return []
             if df is None or df.empty or "ts_code" not in df.columns:
                 return []
-            codes = df["ts_code"].dropna().astype(str)
-            codes = codes.str.replace(".SH", ".XSHG", regex=False).str.replace(".SZ", ".XSHE", regex=False)
-            return sorted(codes.unique().tolist())
+            # 统一到聚宽后缀，并把北交所 821/83x/87x/43x 映射到 920
+            codes = [self._to_jq_code(str(c)) for c in df["ts_code"].dropna().astype(str).tolist()]
+            return sorted(set(codes))
 
         out = self._cache.cached_call(
             "margin_secs",
@@ -1744,7 +2268,7 @@ class TushareProvider(DataProvider):
         return self._margin_stocks(date)
 
     def get_marginsec_stocks(self, date: Optional[Union[str, datetime]] = None) -> Any:
-        # 与融资标的同源接口，直接复用记忆缓存
+        # 与融资标的同源接口（margin_secs），直接复用记忆缓存；与 jq 比时北交所可不一致
         return self._margin_stocks(date)
 
     def get_dominant_future(self, underlying_symbol: str, date: Optional[Union[str, datetime]] = None) -> Any:

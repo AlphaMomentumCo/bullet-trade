@@ -32,11 +32,27 @@ class DummyTushareModule:
         return pd.DataFrame(data)
 
 
+class DummyPro:
+    def __init__(self, ts_module: DummyTushareModule):
+        self._ts = ts_module
+
+    def daily(self, **kwargs):
+        return self._ts.pro_bar(freq="D", asset="E", adj=None, api=self, **kwargs)
+
+    def index_daily(self, **kwargs):
+        return self._ts.pro_bar(freq="D", asset="I", adj=None, api=self, **kwargs)
+
+    def fund_daily(self, **kwargs):
+        return self._ts.pro_bar(freq="D", asset="FD", adj=None, api=self, **kwargs)
+
+
 def _provider_with_dummy_tushare(monkeypatch):
     provider = TushareProvider({"cache_dir": None})
     dummy_ts = DummyTushareModule()
+    dummy_pro = DummyPro(dummy_ts)
     monkeypatch.setattr(provider, "_ensure_ts_module", lambda: dummy_ts)
-    monkeypatch.setattr(provider, "_ensure_client", lambda: object())
+    monkeypatch.setattr(provider, "_ensure_client", lambda: dummy_pro)
+    monkeypatch.setattr(provider, "_ch_available", lambda: False)
     monkeypatch.setattr(
         provider._cache,
         "cached_call",
@@ -115,20 +131,27 @@ def test_tushare_minute_alias_uses_trade_time_and_keeps_native_units(monkeypatch
 @pytest.mark.unit
 def test_tushare_minute_adjustment_joins_daily_factor(monkeypatch):
     provider = TushareProvider({"cache_dir": None})
+    monkeypatch.setattr(provider, "_ch_available", lambda: False)
     df = pd.DataFrame(
         {
             "open": [10.0],
             "high": [10.0],
             "low": [10.0],
             "close": [10.0],
+            "volume": [1000.0],
         },
         index=pd.to_datetime(["2024-01-02 09:35:00"]),
     )
 
     def fake_fetch_adj_factor(security, start_dt, end_dt):
-        if pd.to_datetime(start_dt).normalize() == pd.Timestamp("2024-01-03"):
-            return pd.DataFrame({"trade_date": ["20240103"], "adj_factor": [4.0]})
-        return pd.DataFrame({"trade_date": ["20240102"], "adj_factor": [2.0]})
+        start_d = pd.to_datetime(start_dt).normalize()
+        end_d = pd.to_datetime(end_dt).normalize()
+        rows = []
+        if start_d <= pd.Timestamp("2024-01-02") <= end_d:
+            rows.append({"trade_date": "20240102", "adj_factor": 2.0})
+        if start_d <= pd.Timestamp("2024-01-03") <= end_d:
+            rows.append({"trade_date": "20240103", "adj_factor": 4.0})
+        return pd.DataFrame(rows)
 
     monkeypatch.setattr(provider, "_fetch_adj_factor", fake_fetch_adj_factor)
 
@@ -140,6 +163,7 @@ def test_tushare_minute_adjustment_joins_daily_factor(monkeypatch):
     )
 
     assert adjusted.loc[pd.Timestamp("2024-01-02 09:35:00"), "close"] == 5.0
+    assert adjusted.loc[pd.Timestamp("2024-01-02 09:35:00"), "volume"] == 2000.0
 
 
 @pytest.mark.requires_network

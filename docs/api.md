@@ -66,7 +66,7 @@
 - `get_current_data()`  
   返回延迟加载的行情容器：`current_data[code].last_price/high_limit/low_limit/paused`。实盘优先走数据源实时接口或 tick，无法获取实时则回退到 `get_price`。不支持聚宽的分级属性访问（如 `current_data[code].day_open`），仅提供上述字段。
 - `get_trade_days(start_date=None, end_date=None, count=None)`：返回交易日列表；在回测中 `end_date` 会被截断到当前时间。
-- `get_all_securities(types='stock', date=None)`：返回指定类型的标的信息（DataFrame）；回测默认取当前回测日。
+- `get_all_securities(types='stock', date=None)`：返回指定类型的标的信息（DataFrame）；回测默认取当前回测日。Tushare 下 `types=stock` 默认不含北交所（`TUSHARE_INCLUDE_BSE=1` 可开）；带 `date` 时取 L+D(+P) 再按上市/退市日过滤。
 - `get_index_stocks(index_symbol, date=None)`：返回成分股列表；回测默认取当前回测日。
 - `get_split_dividend(security, start_date=None, end_date=None)`：统一结构的分红/拆分事件列表，每项包含 `security/date/security_type/scale_factor/bonus_pre_tax/per_base`。非回测场景需要显式提供起止日期；与聚宽不同，我们的结果字段固定为上述键。
 - 未提供聚宽的基础面/财务等查询接口（如 `get_fundamentals`），请勿依赖。

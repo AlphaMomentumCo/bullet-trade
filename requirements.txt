@@ -24,6 +24,7 @@ pytest-xdist>=2.5.0  # 并行测试
 
 # 可选依赖
 # tushare>=1.2.0  # Tushare数据源
+# clickhouse-connect>=0.7.0  # Tushare ClickHouse 热链路（Docker 本地库）
 # ta-lib>=0.4.0   # 技术指标库
 
 # 事件循环（高性能，仅非 Windows 平台）
