@@ -1,0 +1,14 @@
+# 可选：供 TUSHARE_CLICKHOUSE_CONFIG 引用（复制为本地文件后改密码即可）
+# 亦可不写文件，直接在 .env 里配 TUSHARE_CLICKHOUSE_HOST 等变量。
+#
+# 用法：
+#   TUSHARE_CLICKHOUSE=true
+#   TUSHARE_CLICKHOUSE_CONFIG=./config/tushare_clickhouse.example.yaml
+
+database:
+  db_type: clickhouse
+  host: "127.0.0.1"
+  port: "8123"
+  user: "default"
+  password: ""
+  db_name: "default"

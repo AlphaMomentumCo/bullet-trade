@@ -17,8 +17,9 @@ from ..cache import CacheManager
 class TushareProvider(DataProvider):
     """基于 tushare.pro 的数据提供者，字段与复权口径对齐兼容层约定。
 
-    可选 ClickHouse 热链路（Docker + tushare-integration 入库）：日线 / 复权因子 /
+    可选 ClickHouse 热链路（Docker 本地库）：日线 / 复权因子 /
     交易日历 / 基础信息等优先读本地库，未命中再回退远程 API。
+    起库与 env 配置见 docs/data/DATA_PROVIDER_TUSHARE.md。
     """
 
     name: str = "tushare"

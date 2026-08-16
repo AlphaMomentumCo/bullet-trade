@@ -20,7 +20,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# 源表名（tushare-integration 入库）
+# 源表名（外部 ETL / tushare-integration 等写入的 ClickHouse 表）
 TABLE_DAILY = "daily"
 TABLE_ADJ_FACTOR = "adj_factor"
 TABLE_INDEX_DAILY = "index_daily"

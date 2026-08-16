@@ -103,7 +103,14 @@
 
 基本面连续查询等路径对多日 `daily_basic` 使用线程池批量拉取。
 
-### 5.4 其它小改动
+### 5.4 ClickHouse 本地热读（可选）
+
+- 客户端：`bullet_trade/data/providers/tushare_clickhouse.py`。
+- 开启方式与 Docker 起库步骤见 **[docs/data/DATA_PROVIDER_TUSHARE.md](docs/data/DATA_PROVIDER_TUSHARE.md)**（本节不重复贴命令）。
+- 本仓库只读本地库；表数据需外部 ETL 写入同一 ClickHouse（例如独立使用开源 tushare-integration，**不要**把该项目 vendoring 进本仓库）。
+- 环境变量：`TUSHARE_CLICKHOUSE=true` + `HOST/PORT/...`，或 `TUSHARE_CLICKHOUSE_CONFIG=./config/tushare_clickhouse.example.yaml`。
+
+### 5.5 其它小改动
 
 - `bullet_trade/data/providers/base.py`：基类补充与 Provider 契约相关的小调整。
 - `bullet_trade/data/cache.py`：缓存行为微调（配合 bench / Provider）。
@@ -187,6 +194,9 @@ DEFAULT_DATA_PROVIDER=jqdata   # 或 tushare
 # JQDATA_PASSWORD=...
 # TUSHARE_TOKEN=...
 # TUSHARE_CUSTOM_URL=...       # 可选自定义代理
+# TUSHARE_CLICKHOUSE=true      # 可选：本地 ClickHouse 热读（见 docs/data/DATA_PROVIDER_TUSHARE.md）
+# TUSHARE_CLICKHOUSE_HOST=127.0.0.1
+# TUSHARE_CLICKHOUSE_PORT=8123
 DATA_CACHE_DIR=~/.bullet-trade/cache
 ```
 
