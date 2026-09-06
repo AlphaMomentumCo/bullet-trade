@@ -1,12 +1,15 @@
 """
 TushareProvider 的 ClickHouse 热链路读库客户端（读路径优化版）。
 
-存储/表设计要点（SOTA）:
+存储/表设计要点（schema v5）:
 1. 源表 ReplacingMergeTree 读默认不加 FINAL；投影到 bt_*_fast（MergeTree）
-2. 窄列 + LowCardinality + 对齐查询的 ORDER BY；点查用小 index_granularity
-3. 开市日专用表 bt_trade_cal_open_fast（去掉 is_open=0，缩短扫描）
-4. PREWHERE 主键过滤；日期用 toYYYYMMDD（UInt32）减少字符串转换
-5. daily_basic / index_weight 支持 asof（<= 目标日最近一期），避免空日回落远程
+2. 窄列 + LowCardinality + ORDER BY (ts_code, trade_date)；日线 PARTITION BY toYYYYMM
+3. bt_daily_adj_fast：日线+复权宽表，热路径消 JOIN
+4. PREWHERE：ts_code + 日期区间；热列裁剪；Date 直出（避免 YYYYMMDD 往返）
+5. 开市日窄表 bt_trade_cal_open_fast；daily_basic / index_weight 支持 asof
+
+物化权威实现已迁至 ``tushare-integration``（分支 dev/table_delay_opt_0905）：
+``python main.py fast materialize``。本模块默认 ``auto_ensure_fast=False``，策略侧只读。
 """
 from __future__ import annotations
 
@@ -33,17 +36,23 @@ TABLE_FUND_BASIC = "fund_basic"
 TABLE_INDEX_WEIGHT = "index_weight"
 
 # 读优化表（本模块 ensure_fast_tables 创建）
-FAST_SCHEMA_VERSION = 3
+FAST_SCHEMA_VERSION = 5
 FAST_META = "bt_fast_meta"
 FAST_DAILY = "bt_daily_fast"
+FAST_DAILY_ADJ = "bt_daily_adj_fast"  # 日线+复权宽表（热路径首选）
 FAST_ADJ = "bt_adj_factor_fast"
 FAST_TRADE_CAL = "bt_trade_cal_fast"
 FAST_TRADE_CAL_OPEN = "bt_trade_cal_open_fast"
 FAST_STOCK_BASIC = "bt_stock_basic_fast"
+FAST_DICT_STOCK_BASIC = "bt_stock_basic_dict"
 FAST_DAILY_BASIC = "bt_daily_basic_fast"
 FAST_FUND_BASIC = "bt_fund_basic_fast"
 FAST_INDEX_WEIGHT = "bt_index_weight_fast"
 FAST_INDEX_DAILY = "bt_index_daily_fast"
+
+# get_price 热路径默认列（不含 pre_close/change/pct_chg）
+_HOT_OHLCV_COLS = ("open", "high", "low", "close", "vol", "amount")
+_HOT_OHLCV_ADJ_COLS = _HOT_OHLCV_COLS + ("adj_factor",)
 
 
 def _parse_bool(value: Any, default: bool = False) -> bool:
@@ -149,9 +158,10 @@ class TushareClickHouseClient:
             cfg.get("prefer_fast", os.getenv("TUSHARE_CLICKHOUSE_FAST", "1")),
             default=True,
         )
+        # 默认关闭：物化已迁至 tushare-integration（python main.py fast materialize）
         self.auto_ensure_fast = _parse_bool(
-            cfg.get("auto_ensure_fast", os.getenv("TUSHARE_CLICKHOUSE_AUTO_FAST", "1")),
-            default=True,
+            cfg.get("auto_ensure_fast", os.getenv("TUSHARE_CLICKHOUSE_AUTO_FAST", "0")),
+            default=False,
         )
 
         self._local = threading.local()
@@ -225,6 +235,23 @@ class TushareClickHouseClient:
             logger.debug("ClickHouse 查询失败: %s | sql=%s", exc, sql[:240])
             return pd.DataFrame()
 
+    def query_columns(self, sql: str) -> pd.DataFrame:
+        """列式组装 DataFrame，热路径批量查询避免 query_df 行式组装开销。"""
+        if not self.is_available():
+            return pd.DataFrame()
+        try:
+            result = self._client().query(sql)
+            names = list(result.column_names or [])
+            cols = list(result.result_columns or [])
+            if not names:
+                return pd.DataFrame()
+            data = {names[i]: cols[i] for i in range(len(names))}
+            return pd.DataFrame(data)
+        except Exception as exc:
+            logger.debug("ClickHouse query_columns 失败: %s | sql=%s", exc, sql[:240])
+            # 回退 query_df
+            return self.query_df(sql)
+
     def query_one(self, sql: str) -> Optional[Dict[str, Any]]:
         """点查：走 query 结果行，避免 query_df 的 pandas 组装开销。"""
         if not self.is_available():
@@ -286,24 +313,56 @@ class TushareClickHouseClient:
 
     @staticmethod
     def _date_ymd_expr(col: str, alias: Optional[str] = None) -> str:
-        # UInt32 YYYYMMDD，避免 toString；别名勿与源列同名
+        # 兼容旧调用：仍可用 UInt32 YYYYMMDD；热路径优先直接选 Date 列
         out = alias or f"{col}_ymd"
         return f"toYYYYMMDD(toDate({col})) AS {out}"
 
     @staticmethod
-    def _rename_ymd(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFrame:
-        ymd = f"{col}_ymd"
+    def _normalize_trade_date_col(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFrame:
+        """统一 trade_date 为可比较的日期列；兼容 Date / YYYYMMDD / 字符串。"""
         if df is None or df.empty:
             return df if df is not None else pd.DataFrame()
-        if ymd in df.columns:
-            out = df.rename(columns={ymd: col})
-            # UInt32 / int → 8 位字符串，供上层统一处理
-            try:
-                out[col] = out[col].astype("Int64").astype(str).str.zfill(8)
-            except Exception:
-                out[col] = out[col].astype(str)
+        ymd = f"{col}_ymd"
+        out = df
+        if ymd in out.columns and col not in out.columns:
+            out = out.rename(columns={ymd: col})
+        if col not in out.columns:
             return out
-        return df
+        series = out[col]
+        # 已是 datetime64 / date
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return out
+        # UInt32 / int YYYYMMDD
+        if pd.api.types.is_integer_dtype(series) or (
+            hasattr(series.dtype, "name") and str(series.dtype).startswith("UInt")
+        ):
+            try:
+                out = out.copy()
+                out[col] = pd.to_datetime(series.astype("Int64").astype(str).str.zfill(8), format="%Y%m%d", errors="coerce")
+                return out
+            except Exception:
+                pass
+        out = out.copy()
+        out[col] = pd.to_datetime(series, errors="coerce")
+        return out
+
+    @staticmethod
+    def _rename_ymd(df: pd.DataFrame, col: str = "trade_date") -> pd.DataFrame:
+        return TushareClickHouseClient._normalize_trade_date_col(df, col=col)
+
+    @staticmethod
+    def _date_prewhere_sql(
+        start: Optional[str],
+        end: Optional[str],
+        *,
+        col: str = "trade_date",
+    ) -> List[str]:
+        parts: List[str] = []
+        if start:
+            parts.append(f"{col} >= toDate('{start}')")
+        if end:
+            parts.append(f"{col} <= toDate('{end}')")
+        return parts
 
     def _fast_schema_version(self) -> Optional[int]:
         if not self.table_exists(FAST_META):
@@ -351,24 +410,35 @@ class TushareClickHouseClient:
             logger.info(
                 "fast schema %s -> %s，重建读优化表", ver, FAST_SCHEMA_VERSION
             )
+        if force:
+            try:
+                self.command(f"DROP DICTIONARY IF EXISTS `{FAST_DICT_STOCK_BASIC}`")
+            except Exception:
+                pass
 
         created: Dict[str, int] = {}
         # finer granularity for point / small-dimension tables
+        # 日线类：PARTITION BY toYYYYMM + ORDER BY (ts_code, trade_date) + minmax(trade_date)
+        _daily_engine = """
+                ENGINE = MergeTree
+                PARTITION BY toYYYYMM(trade_date)
+                ORDER BY (ts_code, trade_date)
+                SETTINGS index_granularity = 4096
+                """
         specs: List[Tuple[str, str, str, str]] = [
             (
                 FAST_DAILY,
                 TABLE_DAILY,
-                """
+                f"""
                 (
                   ts_code LowCardinality(String),
                   trade_date Date,
                   open Float64, high Float64, low Float64, close Float64,
                   pre_close Float64, change Float64, pct_chg Float64,
-                  vol Float64, amount Float64
+                  vol Float64, amount Float64,
+                  INDEX idx_td trade_date TYPE minmax GRANULARITY 1
                 )
-                ENGINE = MergeTree
-                ORDER BY (ts_code, trade_date)
-                SETTINGS index_granularity = 4096
+                {_daily_engine}
                 """,
                 f"""
                 SELECT
@@ -386,17 +456,46 @@ class TushareClickHouseClient:
                 """,
             ),
             (
-                FAST_ADJ,
-                TABLE_ADJ_FACTOR,
-                """
+                FAST_DAILY_ADJ,
+                TABLE_DAILY,
+                f"""
                 (
                   ts_code LowCardinality(String),
                   trade_date Date,
-                  adj_factor Float64
+                  open Float64, high Float64, low Float64, close Float64,
+                  vol Float64, amount Float64,
+                  adj_factor Float64,
+                  INDEX idx_td trade_date TYPE minmax GRANULARITY 1
                 )
-                ENGINE = MergeTree
-                ORDER BY (ts_code, trade_date)
-                SETTINGS index_granularity = 4096
+                {_daily_engine}
+                """,
+                f"""
+                SELECT
+                  d.ts_code AS ts_code,
+                  toDate(d.trade_date) AS trade_date,
+                  toFloat64OrZero(toString(d.open)) AS open,
+                  toFloat64OrZero(toString(d.high)) AS high,
+                  toFloat64OrZero(toString(d.low)) AS low,
+                  toFloat64OrZero(toString(d.close)) AS close,
+                  toFloat64OrZero(toString(d.vol)) AS vol,
+                  toFloat64OrZero(toString(d.amount)) AS amount,
+                  toFloat64OrZero(toString(a.adj_factor)) AS adj_factor
+                FROM {TABLE_DAILY} AS d
+                LEFT JOIN {TABLE_ADJ_FACTOR} AS a
+                  ON d.ts_code = a.ts_code AND toDate(d.trade_date) = toDate(a.trade_date)
+                """,
+            ),
+            (
+                FAST_ADJ,
+                TABLE_ADJ_FACTOR,
+                f"""
+                (
+                  ts_code LowCardinality(String),
+                  trade_date Date,
+                  adj_factor Float64,
+                  INDEX idx_td trade_date TYPE minmax GRANULARITY 1
+                )
+                {_daily_engine}
                 """,
                 f"""
                 SELECT ts_code, toDate(trade_date) AS trade_date,
@@ -551,17 +650,16 @@ class TushareClickHouseClient:
             (
                 FAST_INDEX_DAILY,
                 TABLE_INDEX_DAILY_CORE,
-                """
+                f"""
                 (
                   ts_code LowCardinality(String),
                   trade_date Date,
                   open Float64, high Float64, low Float64, close Float64,
                   pre_close Float64, change Float64, pct_chg Float64,
-                  vol Float64, amount Float64
+                  vol Float64, amount Float64,
+                  INDEX idx_td trade_date TYPE minmax GRANULARITY 1
                 )
-                ENGINE = MergeTree
-                ORDER BY (ts_code, trade_date)
-                SETTINGS index_granularity = 4096
+                {_daily_engine}
                 """,
                 f"""
                 SELECT
@@ -581,6 +679,9 @@ class TushareClickHouseClient:
         ]
 
         for fast_name, source, ddl_body, insert_sql in specs:
+            if fast_name == FAST_DAILY_ADJ and not self.table_exists(TABLE_ADJ_FACTOR):
+                logger.debug("跳过 %s：缺少源表 %s", FAST_DAILY_ADJ, TABLE_ADJ_FACTOR)
+                continue
             if not self.table_exists(source):
                 if source == TABLE_INDEX_DAILY_CORE and self.table_exists(TABLE_INDEX_DAILY):
                     insert_sql = insert_sql.replace(TABLE_INDEX_DAILY_CORE, TABLE_INDEX_DAILY)
@@ -624,6 +725,145 @@ class TushareClickHouseClient:
         self._fast_ready = True
         return created
 
+    @staticmethod
+    def _codes_in_sql(codes: Sequence[str]) -> str:
+        return ", ".join(f"'{_escape_sql_str(str(c))}'" for c in codes if c)
+
+    def fetch_daily_batch(
+        self,
+        ts_codes: Sequence[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        table: Optional[str] = None,
+        *,
+        chunk_size: int = 300,
+        columns: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """多标的日线一次/分块查询（ts_code IN (...))。"""
+        codes = [str(c) for c in ts_codes if c]
+        if not codes:
+            return pd.DataFrame()
+        if table is None:
+            table = self._resolve_table(FAST_DAILY, (TABLE_DAILY,))
+        if not table:
+            return pd.DataFrame()
+        start = _ymd_to_dash(start_date)
+        end = _ymd_to_dash(end_date)
+        date_pre = self._date_prewhere_sql(start, end)
+        # 热列裁剪：默认 OHLCV；宽表可含 adj_factor
+        if columns:
+            sel_cols = [c for c in columns if c]
+        else:
+            sel_cols = list(_HOT_OHLCV_COLS)
+        select_list: List[str] = []
+        for c in ("ts_code", "trade_date", *sel_cols):
+            if c not in select_list:
+                select_list.append(c)
+        select_sql = ", ".join(f"`{c}`" if c == "change" else c for c in select_list)
+
+        frames: List[pd.DataFrame] = []
+        for i in range(0, len(codes), max(1, int(chunk_size))):
+            batch = codes[i : i + chunk_size]
+            pre_parts = [f"ts_code IN ({self._codes_in_sql(batch)})"] + date_pre
+            sql = f"""
+                SELECT {select_sql}
+                FROM {self._from_clause(table)}
+                PREWHERE {' AND '.join(pre_parts)}
+                ORDER BY ts_code, trade_date
+                SETTINGS optimize_read_in_order = 1
+            """
+            part = self.query_columns(sql)
+            if part is not None and not part.empty:
+                frames.append(self._normalize_trade_date_col(part))
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def fetch_daily_and_adj_batch(
+        self,
+        ts_codes: Sequence[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        *,
+        chunk_size: int = 300,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """多标的日线+复权：优先宽表 bt_daily_adj_fast（无 JOIN）；否则 LEFT JOIN 回退。
+
+        返回 (daily_with_optional_adj_factor, adj_df)。
+        宽表/合并路径下 adj_factor 已在 daily 上，adj_df 为空（避免上层再 merge）。
+        """
+        codes = [str(c) for c in ts_codes if c]
+        if not codes:
+            return pd.DataFrame(), pd.DataFrame()
+
+        wide = self._resolve_table(FAST_DAILY_ADJ, ())
+        if wide:
+            daily = self.fetch_daily_batch(
+                codes,
+                start_date,
+                end_date,
+                table=wide,
+                chunk_size=chunk_size,
+                columns=_HOT_OHLCV_ADJ_COLS,
+            )
+            return daily, pd.DataFrame()
+
+        daily_t = self._resolve_table(FAST_DAILY, (TABLE_DAILY,))
+        adj_t = self._resolve_table(FAST_ADJ, (TABLE_ADJ_FACTOR,))
+        if not daily_t or not adj_t:
+            daily = self.fetch_daily_batch(codes, start_date, end_date, table=daily_t)
+            return daily, pd.DataFrame()
+        start = _ymd_to_dash(start_date)
+        end = _ymd_to_dash(end_date)
+        date_pre = self._date_prewhere_sql(start, end, col="d.trade_date")
+        adj_dates = self._date_prewhere_sql(start, end)
+        frames: List[pd.DataFrame] = []
+        for i in range(0, len(codes), max(1, int(chunk_size))):
+            batch = codes[i : i + chunk_size]
+            in_sql = self._codes_in_sql(batch)
+            pre_parts = [f"d.ts_code IN ({in_sql})"] + date_pre
+            adj_pre = [f"ts_code IN ({in_sql})"] + adj_dates
+            sql = f"""
+                SELECT
+                  d.ts_code AS ts_code,
+                  d.trade_date AS trade_date,
+                  d.open, d.high, d.low, d.close, d.vol, d.amount,
+                  a.adj_factor AS adj_factor
+                FROM {self._from_clause(daily_t)} AS d
+                LEFT JOIN (
+                  SELECT ts_code, trade_date, adj_factor
+                  FROM {self._from_clause(adj_t)}
+                  PREWHERE {' AND '.join(adj_pre)}
+                ) AS a
+                  ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
+                PREWHERE {' AND '.join(pre_parts)}
+                ORDER BY d.ts_code, d.trade_date
+                SETTINGS join_algorithm = 'hash', optimize_read_in_order = 1
+            """
+            part = self.query_columns(sql)
+            if part is not None and not part.empty:
+                frames.append(self._normalize_trade_date_col(part))
+        if not frames:
+            return pd.DataFrame(), pd.DataFrame()
+        return pd.concat(frames, ignore_index=True), pd.DataFrame()
+
+    def fetch_index_daily_batch(
+        self,
+        ts_codes: Sequence[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+        *,
+        chunk_size: int = 300,
+    ) -> pd.DataFrame:
+        table = self._resolve_table(
+            FAST_INDEX_DAILY, (TABLE_INDEX_DAILY_CORE, TABLE_INDEX_DAILY)
+        )
+        if not table:
+            return pd.DataFrame()
+        return self.fetch_daily_batch(
+            ts_codes, start_date, end_date, table=table, chunk_size=chunk_size
+        )
+
     # -------------------- 查询 --------------------
     def fetch_daily(
         self,
@@ -638,24 +878,17 @@ class TushareClickHouseClient:
             return pd.DataFrame()
         start = _ymd_to_dash(start_date)
         end = _ymd_to_dash(end_date)
-        prewhere = [f"ts_code = '{_escape_sql_str(ts_code)}'"]
-        where = []
-        if start:
-            where.append(f"trade_date >= toDate('{start}')")
-        if end:
-            where.append(f"trade_date <= toDate('{end}')")
-        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        pre = [f"ts_code = '{_escape_sql_str(ts_code)}'"] + self._date_prewhere_sql(start, end)
         sql = f"""
             SELECT
-              ts_code,
-              {self._date_ymd_expr("trade_date")},
-              open, high, low, close, pre_close, `change`, pct_chg, vol, amount
+              ts_code, trade_date,
+              open, high, low, close, vol, amount
             FROM {self._from_clause(table)}
-            PREWHERE {' AND '.join(prewhere)}
-            {where_sql}
+            PREWHERE {' AND '.join(pre)}
             ORDER BY trade_date
+            SETTINGS optimize_read_in_order = 1
         """
-        return self._rename_ymd(self.query_df(sql))
+        return self._normalize_trade_date_col(self.query_columns(sql))
 
     def fetch_daily_and_adj(
         self,
@@ -663,7 +896,22 @@ class TushareClickHouseClient:
         start_date: Optional[str],
         end_date: Optional[str],
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """日线 + 复权因子一次 JOIN，减少 get_price 双 RTT。"""
+        """日线 + 复权：优先宽表；否则一次 JOIN。adj_factor 落在 daily 上时 adj 返回空。"""
+        wide = self._resolve_table(FAST_DAILY_ADJ, ())
+        if wide:
+            start = _ymd_to_dash(start_date)
+            end = _ymd_to_dash(end_date)
+            pre = [f"ts_code = '{_escape_sql_str(ts_code)}'"] + self._date_prewhere_sql(start, end)
+            sql = f"""
+                SELECT ts_code, trade_date, open, high, low, close, vol, amount, adj_factor
+                FROM {self._from_clause(wide)}
+                PREWHERE {' AND '.join(pre)}
+                ORDER BY trade_date
+                SETTINGS optimize_read_in_order = 1
+            """
+            df = self._normalize_trade_date_col(self.query_columns(sql))
+            return df, pd.DataFrame()
+
         daily_t = self._resolve_table(FAST_DAILY, (TABLE_DAILY,))
         adj_t = self._resolve_table(FAST_ADJ, (TABLE_ADJ_FACTOR,))
         if not daily_t or not adj_t:
@@ -673,52 +921,30 @@ class TushareClickHouseClient:
         start = _ymd_to_dash(start_date)
         end = _ymd_to_dash(end_date)
         code = _escape_sql_str(ts_code)
-        where = []
-        if start:
-            where.append(f"d.trade_date >= toDate('{start}')")
-        if end:
-            where.append(f"d.trade_date <= toDate('{end}')")
-        where_sql = (" AND " + " AND ".join(where)) if where else ""
+        date_pre = self._date_prewhere_sql(start, end, col="d.trade_date")
+        adj_pre = [f"ts_code = '{code}'"] + self._date_prewhere_sql(start, end)
+        pre = [f"d.ts_code = '{code}'"] + date_pre
         sql = f"""
             SELECT
               d.ts_code AS ts_code,
-              toYYYYMMDD(toDate(d.trade_date)) AS trade_date_ymd,
-              d.open, d.high, d.low, d.close, d.pre_close, d.`change`, d.pct_chg, d.vol, d.amount,
+              d.trade_date AS trade_date,
+              d.open, d.high, d.low, d.close, d.vol, d.amount,
               a.adj_factor AS adj_factor
             FROM {self._from_clause(daily_t)} AS d
-            LEFT JOIN {self._from_clause(adj_t)} AS a
+            LEFT JOIN (
+              SELECT ts_code, trade_date, adj_factor
+              FROM {self._from_clause(adj_t)}
+              PREWHERE {' AND '.join(adj_pre)}
+            ) AS a
               ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
-            PREWHERE d.ts_code = '{code}'
-            WHERE 1{where_sql}
+            PREWHERE {' AND '.join(pre)}
             ORDER BY d.trade_date
+            SETTINGS join_algorithm = 'hash', optimize_read_in_order = 1
         """
-        df = self.query_df(sql)
+        df = self._normalize_trade_date_col(self.query_columns(sql))
         if df is None or df.empty:
             return pd.DataFrame(), pd.DataFrame()
-        df = self._rename_ymd(df)
-        daily = df[
-            [
-                c
-                for c in (
-                    "ts_code",
-                    "trade_date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "pre_close",
-                    "change",
-                    "pct_chg",
-                    "vol",
-                    "amount",
-                )
-                if c in df.columns
-            ]
-        ].copy()
-        adj = df[[c for c in ("ts_code", "trade_date", "adj_factor") if c in df.columns]].copy()
-        if "adj_factor" in adj.columns:
-            adj = adj.dropna(subset=["adj_factor"])
-        return daily, adj
+        return df, pd.DataFrame()
 
     def fetch_adj_factor(
         self,
@@ -731,24 +957,16 @@ class TushareClickHouseClient:
             return pd.DataFrame()
         start = _ymd_to_dash(start_date)
         end = _ymd_to_dash(end_date)
-        prewhere = [f"ts_code = '{_escape_sql_str(ts_code)}'"]
-        where = []
-        if start:
-            where.append(f"trade_date >= toDate('{start}')")
-        if end:
-            where.append(f"trade_date <= toDate('{end}')")
-        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        pre = [f"ts_code = '{_escape_sql_str(ts_code)}'"] + self._date_prewhere_sql(start, end)
         sql = f"""
             SELECT
-              ts_code,
-              {self._date_ymd_expr("trade_date")},
-              adj_factor
+              ts_code, trade_date, adj_factor
             FROM {self._from_clause(table)}
-            PREWHERE {' AND '.join(prewhere)}
-            {where_sql}
+            PREWHERE {' AND '.join(pre)}
             ORDER BY trade_date
+            SETTINGS optimize_read_in_order = 1
         """
-        return self._rename_ymd(self.query_df(sql))
+        return self._normalize_trade_date_col(self.query_columns(sql))
 
     def fetch_index_daily(
         self,

@@ -311,9 +311,48 @@ class TushareProvider(DataProvider):
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
-        securities = security if isinstance(security, (list, tuple)) else [security]
-        frames: Dict[str, pd.DataFrame] = {}
+        """取行情。单标的 / 多标的同一入口，按数量自动路由：
 
+        - 日线 + ClickHouse 可用：走 ``_get_price_batch_via_ch``（1 票与 N 票同一套）
+        - 否则：逐票 ``_get_price_single``（仍可命中 CH 单票或远程）
+
+        ``security`` 可为股票或指数（或列表）；指数与股票勿混在同一列表。
+        """
+        _ = (fill_paused, prefer_engine, force_no_engine)
+        securities = list(security if isinstance(security, (list, tuple)) else [security])
+        # 自动路由：有 CH 时优先批量热路径；否则走远程/proxy 批量（逗号多码，避免逐票 HTTP）
+        if securities and self._ch_available():
+            batched = self._get_price_batch_via_ch(
+                securities,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                panel=panel,
+                pre_factor_ref_date=pre_factor_ref_date,
+            )
+            if batched is not None:
+                return batched
+        if securities:
+            batched = self._get_price_batch_via_remote(
+                securities,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                panel=panel,
+                pre_factor_ref_date=pre_factor_ref_date,
+            )
+            if batched is not None:
+                return batched
+
+        frames: Dict[str, pd.DataFrame] = {}
         for sec in securities:
             asset = self._infer_asset(sec)
             kwargs = {
@@ -358,6 +397,545 @@ class TushareProvider(DataProvider):
             long_rows.append(tmp)
         merged = pd.concat(long_rows, axis=0)
         return merged
+
+    def _get_price_batch_via_ch(
+        self,
+        securities: List[str],
+        *,
+        start_date: Optional[Union[str, datetime]],
+        end_date: Optional[Union[str, datetime]],
+        frequency: str,
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        panel: bool,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> Optional[pd.DataFrame]:
+        """多标的（含单票）日线走 ClickHouse 批量查询；不适用则返回 None 回退逐票。
+
+        由 ``get_price`` 按 security 列表长度自动调用，不对外暴露独立 API。
+        """
+        if not self._ch_available() or not securities:
+            return None
+        freq = self._normalize_frequency(frequency)
+        if freq != "D":
+            return None
+
+        meta: List[Tuple[str, str, str]] = []  # jq_code, ts_code, asset
+        for sec in securities:
+            asset = self._infer_asset(sec)
+            if asset not in ("E", "I"):
+                return None
+            meta.append((str(sec), self._to_ts_code(sec), asset))
+
+        assets = {a for _, _, a in meta}
+        if len(assets) != 1:
+            # 股票/指数混查时拆两批也可，这里简化：回退逐票
+            return None
+        asset = next(iter(assets))
+        end_str = self._format_date(end_date)
+        start_str = self._format_date(start_date)
+        if count and not start_str:
+            start_str = self._estimate_start_for_count(end_date or end_str, int(count), frequency)
+
+        assert self._ch is not None
+        ts_codes = [ts for _, ts, _ in meta]
+        try:
+            if asset == "E" and fq in ("pre", "post"):
+                raw_daily, raw_adj = self._ch.fetch_daily_and_adj_batch(
+                    ts_codes, start_str, end_str
+                )
+            elif asset == "E":
+                raw_daily = self._ch.fetch_daily_batch(ts_codes, start_str, end_str)
+                raw_adj = pd.DataFrame()
+            else:
+                raw_daily = self._ch.fetch_index_daily_batch(ts_codes, start_str, end_str)
+                raw_adj = pd.DataFrame()
+        except Exception:
+            return None
+
+        if raw_daily is None or raw_daily.empty:
+            # 批量空：可能库未覆盖，回退逐票（允许部分远程）
+            return None
+
+        # 前复权锚点：批量路径优先用库内最大交易日，避免逐票补拉未来区间 adj
+        resolved_ref = pre_factor_ref_date
+        if resolved_ref is None and fq == "pre" and asset == "E":
+            try:
+                max_in_db = pd.to_datetime(raw_daily["trade_date"], errors="coerce").max()
+            except Exception:
+                max_in_db = None
+            latest = self._latest_trade_day()
+            if max_in_db is not None and not pd.isna(max_in_db):
+                if latest is None or pd.to_datetime(latest) > max_in_db:
+                    resolved_ref = max_in_db
+                else:
+                    resolved_ref = latest
+            else:
+                resolved_ref = latest
+
+        daily_by = {
+            str(code): g
+            for code, g in raw_daily.groupby("ts_code", sort=False)
+        }
+        adj_by: Dict[str, pd.DataFrame] = {}
+        if raw_adj is not None and not raw_adj.empty and "ts_code" in raw_adj.columns:
+            adj_by = {
+                str(code): g
+                for code, g in raw_adj.groupby("ts_code", sort=False)
+            }
+
+        # 批量矢量化整理（避免逐票 copy/join）；缺失标的再回退单票
+        present = [(jq, ts, a) for jq, ts, a in meta if ts in daily_by and not daily_by[ts].empty]
+        missing = [(jq, ts, a) for jq, ts, a in meta if ts not in daily_by or daily_by[ts].empty]
+
+        frames: Dict[str, pd.DataFrame] = {}
+        if present:
+            try:
+                frames.update(
+                    self._finalize_price_batch_frames(
+                        present_meta=present,
+                        daily_by=daily_by,
+                        adj_by=adj_by,
+                        frequency=frequency,
+                        fields=fields,
+                        skip_paused=skip_paused,
+                        fq=fq,
+                        count=count,
+                        pre_factor_ref_date=resolved_ref,
+                        asset=asset,
+                    )
+                )
+            except Exception:
+                frames = {}
+                for jq_code, ts_code, _asset in present:
+                    frames[jq_code] = self._finalize_price_frame(
+                        security=jq_code,
+                        df=daily_by[ts_code],
+                        factor_df=adj_by.get(ts_code),
+                        already_qfq=False,
+                        frequency=frequency,
+                        fields=fields,
+                        skip_paused=skip_paused,
+                        fq=fq,
+                        count=count,
+                        pre_factor_ref_date=resolved_ref,
+                        asset=_asset,
+                        start_str=start_str,
+                        end_str=end_str,
+                    )
+
+        for jq_code, _ts, _asset in missing:
+            frames[jq_code] = self._get_price_single(
+                jq_code,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                pre_factor_ref_date=resolved_ref,
+                asset=_asset,
+            )
+
+        if panel:
+            # 保持 meta 顺序；单标的时返回普通 DataFrame（与历史 get_price 单票口径一致）
+            ordered = {jq: frames[jq] for jq, _, _ in meta if jq in frames}
+            if not ordered:
+                return pd.DataFrame()
+            if len(ordered) == 1:
+                return next(iter(ordered.values()))
+            return pd.concat(ordered, axis=1)
+        long_rows = []
+        for jq, _, _ in meta:
+            df = frames.get(jq)
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                continue
+            tmp = df.copy()
+            tmp["code"] = jq
+            long_rows.append(tmp)
+        return pd.concat(long_rows, axis=0) if long_rows else pd.DataFrame()
+
+    def _get_price_batch_via_remote(
+        self,
+        securities: List[str],
+        *,
+        start_date: Optional[Union[str, datetime]],
+        end_date: Optional[Union[str, datetime]],
+        frequency: str,
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        panel: bool,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> Optional[pd.DataFrame]:
+        """无 CH 时：一次（或分块）远程/proxy 多码查询，避免逐票 HTTP。
+
+        对 local_tushare_proxy：``daily`` + ``fields`` 含 ``adj_factor`` 会走 ``bt_daily_adj_fast``。
+        """
+        if not securities:
+            return None
+        freq = self._normalize_frequency(frequency)
+        if freq != "D":
+            return None
+
+        meta: List[Tuple[str, str, str]] = []
+        for sec in securities:
+            asset = self._infer_asset(sec)
+            if asset not in ("E", "I"):
+                return None
+            meta.append((str(sec), self._to_ts_code(sec), asset))
+        assets = {a for _, _, a in meta}
+        if len(assets) != 1:
+            return None
+        asset = next(iter(assets))
+        end_str = self._format_date(end_date)
+        start_str = self._format_date(start_date)
+        if count and not start_str:
+            start_str = self._estimate_start_for_count(end_date or end_str, int(count), frequency)
+
+        try:
+            pro = self._ensure_client()
+        except Exception:
+            return None
+
+        ts_codes = [ts for _, ts, _ in meta]
+        chunk_size = 300
+        daily_parts: List[pd.DataFrame] = []
+        adj_parts: List[pd.DataFrame] = []
+        want_adj = asset == "E" and fq in ("pre", "post")
+        # 宽表友好字段：proxy 见 adj_factor 即映射 bt_daily_adj_fast
+        daily_fields = "ts_code,trade_date,open,high,low,close,vol,amount"
+        if want_adj:
+            daily_fields += ",adj_factor"
+
+        try:
+            for i in range(0, len(ts_codes), chunk_size):
+                batch = ts_codes[i : i + chunk_size]
+                code_param = ",".join(batch)
+                if asset == "E":
+                    part = pro.daily(
+                        ts_code=code_param,
+                        start_date=start_str,
+                        end_date=end_str,
+                        fields=daily_fields,
+                    )
+                else:
+                    part = pro.index_daily(
+                        ts_code=code_param,
+                        start_date=start_str,
+                        end_date=end_str,
+                    )
+                if part is not None and not part.empty:
+                    daily_parts.append(part)
+                    # 若未带出 adj_factor，再批量补因子
+                    if want_adj and "adj_factor" not in part.columns:
+                        af = pro.adj_factor(
+                            ts_code=code_param,
+                            start_date=start_str,
+                            end_date=end_str,
+                            fields="ts_code,trade_date,adj_factor",
+                        )
+                        if af is not None and not af.empty:
+                            adj_parts.append(af)
+        except Exception:
+            return None
+
+        if not daily_parts:
+            return None
+        raw_daily = pd.concat(daily_parts, ignore_index=True)
+        raw_adj = pd.concat(adj_parts, ignore_index=True) if adj_parts else pd.DataFrame()
+
+        resolved_ref = pre_factor_ref_date
+        if resolved_ref is None and fq == "pre" and asset == "E":
+            try:
+                max_in_db = pd.to_datetime(raw_daily["trade_date"], errors="coerce").max()
+            except Exception:
+                max_in_db = None
+            latest = self._latest_trade_day()
+            if max_in_db is not None and not pd.isna(max_in_db):
+                if latest is None or pd.to_datetime(latest) > max_in_db:
+                    resolved_ref = max_in_db
+                else:
+                    resolved_ref = latest
+            else:
+                resolved_ref = latest
+
+        daily_by = {str(code): g for code, g in raw_daily.groupby("ts_code", sort=False)}
+        adj_by: Dict[str, pd.DataFrame] = {}
+        if raw_adj is not None and not raw_adj.empty and "ts_code" in raw_adj.columns:
+            adj_by = {str(code): g for code, g in raw_adj.groupby("ts_code", sort=False)}
+
+        present = [(jq, ts, a) for jq, ts, a in meta if ts in daily_by and not daily_by[ts].empty]
+        missing = [(jq, ts, a) for jq, ts, a in meta if ts not in daily_by or daily_by[ts].empty]
+        frames: Dict[str, pd.DataFrame] = {}
+        if present:
+            try:
+                frames.update(
+                    self._finalize_price_batch_frames(
+                        present_meta=present,
+                        daily_by=daily_by,
+                        adj_by=adj_by,
+                        frequency=frequency,
+                        fields=fields,
+                        skip_paused=skip_paused,
+                        fq=fq,
+                        count=count,
+                        pre_factor_ref_date=resolved_ref,
+                        asset=asset,
+                    )
+                )
+            except Exception:
+                return None
+        for jq_code, _ts, _asset in missing:
+            try:
+                frames[jq_code] = self._get_price_single(
+                    jq_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=frequency,
+                    fields=fields,
+                    skip_paused=skip_paused,
+                    fq=fq,
+                    count=count,
+                    pre_factor_ref_date=pre_factor_ref_date,
+                    asset=_asset,
+                )
+            except Exception:
+                frames[jq_code] = pd.DataFrame()
+
+        if not frames:
+            return None
+        if panel:
+            ordered = {jq: frames[jq] for jq, _, _ in meta if jq in frames}
+            if not ordered:
+                return pd.DataFrame()
+            if len(ordered) == 1:
+                return next(iter(ordered.values()))
+            return pd.concat(ordered, axis=1)
+        long_rows = []
+        for jq, _, _ in meta:
+            df = frames.get(jq)
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                continue
+            tmp = df.copy()
+            tmp["code"] = jq
+            long_rows.append(tmp)
+        return pd.concat(long_rows, axis=0) if long_rows else pd.DataFrame()
+
+    def _finalize_price_batch_frames(
+        self,
+        *,
+        present_meta: List[Tuple[str, str, str]],
+        daily_by: Dict[str, pd.DataFrame],
+        adj_by: Dict[str, pd.DataFrame],
+        frequency: str,
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+        asset: str,
+    ) -> Dict[str, pd.DataFrame]:
+        """多标的日线一次矢量化整理，返回 {jq_code: frame}。
+
+        若 daily 已含 adj_factor（宽表/JOIN 结果），不再二次 merge。
+        """
+        freq = self._normalize_frequency(frequency)
+        ts_to_jq = {ts: jq for jq, ts, _a in present_meta}
+        parts = [daily_by[ts] for _jq, ts, _a in present_meta]
+        df = pd.concat(parts, ignore_index=True)
+        if "ts_code" not in df.columns:
+            raise ValueError("batch daily missing ts_code")
+        df = df.copy()
+        df["_jq"] = df["ts_code"].map(ts_to_jq)
+        df.rename(
+            columns={
+                "vol": "volume",
+                "amount": "money",
+            },
+            inplace=True,
+        )
+        if "money" not in df.columns:
+            df["money"] = 0.0
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        df = self._normalize_price_units(df, freq, asset)
+        if not pd.api.types.is_datetime64_any_dtype(df["trade_date"]):
+            df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+        if skip_paused and "is_paused" in df.columns:
+            df = df[df["is_paused"] == 0]
+
+        need_adj = asset == "E" and fq in ("pre", "post")
+        if need_adj:
+            if "adj_factor" not in df.columns:
+                adj_parts = []
+                for _jq, ts_code, _a in present_meta:
+                    af = adj_by.get(ts_code)
+                    if af is None or af.empty or "adj_factor" not in af.columns:
+                        continue
+                    ap = af[["trade_date", "adj_factor"]].copy()
+                    ap["ts_code"] = ts_code
+                    adj_parts.append(ap)
+                if adj_parts:
+                    adj = pd.concat(adj_parts, ignore_index=True)
+                    adj["trade_date"] = pd.to_datetime(adj["trade_date"], errors="coerce")
+                    df = df.merge(adj, on=["ts_code", "trade_date"], how="left")
+                else:
+                    df["adj_factor"] = 1.0
+            df["adj_factor"] = (
+                df.groupby("ts_code", sort=False)["adj_factor"].ffill().bfill().fillna(1.0)
+            )
+            # 全 1 因子：跳过乘除（本地 CSV 同步常见）
+            if not (df["adj_factor"] == 1.0).all():
+                resolved_ref = pre_factor_ref_date
+                if resolved_ref is None and fq == "pre":
+                    resolved_ref = self._latest_trade_day()
+                if resolved_ref is None:
+                    resolved_ref = df["trade_date"].max()
+                ref_dt = pd.to_datetime(resolved_ref).normalize()
+                fac = df[["ts_code", "trade_date", "adj_factor"]].dropna()
+                prior = fac[fac["trade_date"] <= ref_dt]
+                if prior.empty:
+                    ref_map = fac.groupby("ts_code", sort=False)["adj_factor"].last()
+                else:
+                    idx = prior.groupby("ts_code", sort=False)["trade_date"].idxmax()
+                    ref_map = prior.loc[idx].set_index("ts_code")["adj_factor"]
+                df["_ref"] = df["ts_code"].map(ref_map).astype(float).replace(0, pd.NA)
+                if fq == "pre":
+                    ratio = df["adj_factor"] / df["_ref"]
+                else:
+                    ratio = df["_ref"] / df["adj_factor"]
+                ratio = ratio.fillna(1.0)
+                for col in ("open", "high", "low", "close"):
+                    if col in df.columns:
+                        df[col] = df[col].astype(float) * ratio
+                if "volume" in df.columns:
+                    safe = ratio.replace(0, pd.NA)
+                    df["volume"] = (df["volume"].astype(float) / safe).fillna(df["volume"])
+                df.drop(columns=["_ref"], inplace=True, errors="ignore")
+            df.drop(columns=["adj_factor"], inplace=True, errors="ignore")
+
+        # CH 已 ORDER BY ts_code, trade_date；按 _jq 分组保持相对顺序，避免再 sort
+        drop_cols = [c for c in ("ts_code", "_jq", "pre_close", "change", "pct_chg") if c in df.columns]
+        out: Dict[str, pd.DataFrame] = {}
+        for jq_code, g in df.groupby("_jq", sort=False):
+            part = g.drop(columns=[c for c in drop_cols if c in g.columns], errors="ignore")
+            part = part.set_index("trade_date")
+            if count:
+                part = part.tail(int(count))
+            part = self._apply_fields(part, fields)
+            out[str(jq_code)] = part
+        return out
+
+    def _finalize_price_frame(
+        self,
+        *,
+        security: str,
+        df: pd.DataFrame,
+        factor_df: Optional[pd.DataFrame],
+        already_qfq: bool,
+        frequency: str,
+        fields: Optional[List[str]],
+        skip_paused: bool,
+        fq: Optional[str],
+        count: Optional[int],
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+        asset: str,
+        start_str: Optional[str],
+        end_str: Optional[str],
+    ) -> pd.DataFrame:
+        """将 CH/远程原始 OHLCV(+可选 adj) 整理为 get_price 输出帧。"""
+        freq = self._normalize_frequency(frequency)
+        ts_code = self._to_ts_code(security)
+        mem_key = (
+            f"price:{ts_code}:{start_str}:{end_str}:{freq}:{fq}:{count}:"
+            f"{self._format_date(pre_factor_ref_date)}:{skip_paused}:{tuple(fields or ())}"
+        )
+        hit, cached = self._memo_get(mem_key)
+        if hit:
+            return cached.copy() if isinstance(cached, pd.DataFrame) else cached
+
+        if df is None or df.empty:
+            return self._memo_set(mem_key, pd.DataFrame())
+
+        # 宽表：adj_factor 已在日线帧上
+        if (
+            (factor_df is None or factor_df.empty)
+            and "adj_factor" in df.columns
+        ):
+            factor_df = df[["trade_date", "adj_factor"]].copy() if "trade_date" in df.columns else None
+
+        need_local_adj = (
+            asset == "E"
+            and fq in ("pre", "post")
+            and not already_qfq
+            and (factor_df is None or factor_df.empty)
+        )
+        if need_local_adj and self._ch_available():
+            try:
+                factor_df = self._fetch_adj_factor(
+                    security,
+                    pd.to_datetime(start_str or end_str),
+                    pd.to_datetime(end_str or start_str),
+                )
+            except Exception:
+                factor_df = None
+
+        time_col = "trade_time" if self._is_minute_frequency(freq) and "trade_time" in df.columns else "trade_date"
+        if time_col not in df.columns:
+            for cand in ("trade_time", "trade_date", "datetime"):
+                if cand in df.columns:
+                    time_col = cand
+                    break
+        out = df.sort_values(time_col).copy()
+        out.index = pd.to_datetime(out[time_col])
+        out.rename(
+            columns={
+                "vol": "volume",
+                "amount": "money",
+                "high_limit": "high_limit",
+                "low_limit": "low_limit",
+            },
+            inplace=True,
+        )
+        if "ts_code" in out.columns:
+            out["ts_code"] = out["ts_code"].map(self._to_jq_code)
+        out["money"] = out.get("money", 0.0)
+        out["volume"] = out.get("volume", 0.0)
+        out = self._normalize_price_units(out, freq, asset)
+
+        if skip_paused and "is_paused" in out.columns:
+            out = out[out["is_paused"] == 0]
+
+        if asset == "E" and fq in ("pre", "post") and not already_qfq:
+            resolved_ref = pre_factor_ref_date
+            if resolved_ref is None and fq == "pre":
+                latest = self._latest_trade_day()
+                if latest is not None:
+                    resolved_ref = latest
+            if factor_df is not None and not factor_df.empty and "adj_factor" in factor_df.columns:
+                factor_df = self._ensure_adj_factor_covers_ref(
+                    security, factor_df, out.index.min(), resolved_ref
+                )
+                out = self._apply_adjustment_with_factor(
+                    out, factor_df, fq=fq, pre_factor_ref_date=resolved_ref
+                )
+            else:
+                out = self._apply_adjustment(
+                    security=security,
+                    df=out,
+                    fq=fq,
+                    pre_factor_ref_date=resolved_ref,
+                )
+
+        if count:
+            out = out.tail(count)
+        out = self._apply_fields(out, fields)
+        return self._memo_set(mem_key, out)
 
     def _fetch_ohlcv_raw(
         self,
@@ -494,6 +1072,14 @@ class TushareProvider(DataProvider):
             try:
                 df, factor_df = self._ch.fetch_daily_and_adj(ts_code, start_str, end_str)
                 already_qfq = False
+                # 宽表路径：adj_factor 落在日线帧上
+                if (
+                    (factor_df is None or factor_df.empty)
+                    and df is not None
+                    and not df.empty
+                    and "adj_factor" in df.columns
+                ):
+                    factor_df = df[["trade_date", "adj_factor"]].copy()
             except Exception:
                 df, factor_df = pd.DataFrame(), None
 
@@ -884,13 +1470,19 @@ class TushareProvider(DataProvider):
         return adj_df
 
     def _latest_trade_day(self) -> Optional[datetime]:
+        cached = getattr(self, "_latest_trade_day_cache", None)
+        if cached is not None or getattr(self, "_latest_trade_day_checked", False):
+            return cached
         try:
             days = self.get_trade_days(end_date=Date.today(), count=1)
             if days:
-                return pd.to_datetime(days[-1])
+                self._latest_trade_day_cache = pd.to_datetime(days[-1])
+            else:
+                self._latest_trade_day_cache = None
         except Exception:
-            return None
-        return None
+            self._latest_trade_day_cache = None
+        self._latest_trade_day_checked = True
+        return self._latest_trade_day_cache
 
     def _fetch_adj_factor(self, security: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
         kwargs = {
